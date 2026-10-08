@@ -30,6 +30,7 @@ Re-runnable: an existing path is reported as skipped, never overwritten.
 
 Environment:
   VAULT_ADDR      Vault base URL (default http://127.0.0.1:8200)
+  VAULT_URI       Vault URI the services read (default http://127.0.0.1:8200)
   VAULT_TOKEN     Vault token, required. Compose maps it from VAULT_DEV_ROOT_TOKEN_ID
   SECRETS_DIR     Directory holding the *-secrets.json files
                   (default <script_dir>/../centralized-configuration/service-secrets,
@@ -66,6 +67,7 @@ require_bin() {
 }
 require_bin vault
 require_bin jq
+require_bin base64
 
 [ -n "${VAULT_TOKEN:-}" ] || die "VAULT_TOKEN is empty or unset; export it (compose maps it from VAULT_DEV_ROOT_TOKEN_ID, see .env.example)"
 
@@ -82,7 +84,7 @@ if [ "${ALL_PROFILES}" -eq 1 ]; then
 else
   _raw_profiles="${PROFILES:-${PROFILE:-dev}}"
   IFS=',' read -r -a _profiles <<< "${_raw_profiles}"
-  for _p in "${_profiles[@]}"; do
+  for _p in ${_profiles[@]+"${_profiles[@]}"}; do
     _p="$(printf '%s' "${_p}" | tr -d '[:space:]')"
     [ -n "${_p}" ] || continue
     profiles+=("${_p}")
@@ -95,11 +97,18 @@ fi
 # Loading prod secrets requires an explicitly non-local VAULT_ADDR AND an explicit
 # CONFIRM_PROD=yes. Checked before any network contact so a misconfigured local
 # run never even authenticates against a dev server while claiming prod.
+# The gate only ever applies to files whose profile is actually being loaded:
+# prod files that are merely present on disk are skipped, never gated (see the
+# selection below), because the DEV-ONLY policy keeps them on local disks.
 is_local_addr() {
   case "${VAULT_ADDR}" in
-    http://127.0.0.1|http://127.0.0.1:*|https://127.0.0.1|https://127.0.0.1:*) return 0 ;;
-    http://localhost|http://localhost:*|https://localhost|https://localhost:*) return 0 ;;
-    http://\[::1\]|http://\[::1\]:*|https://\[::1\]|https://\[::1\]:*) return 0 ;;
+    http://127.0.0.1|http://127.0.0.1:*|https://127.0.0.1|https://127.0.0.1:*|\
+    http://localhost|http://localhost:*|https://localhost|https://localhost:*|\
+    http://0.0.0.0|http://0.0.0.0:*|https://0.0.0.0|https://0.0.0.0:*|\
+    http://\[::\]|http://\[::\]:*|https://\[::\]|https://\[::\]:*|\
+    http://\[::1\]|http://\[::1\]:*|https://\[::1\]|https://\[::1\]:*)
+      return 0
+      ;;
     *) return 1 ;;
   esac
 }
@@ -113,8 +122,8 @@ require_prod_gate() {
   fi
 }
 
-# Explicitly requested profiles are gated here, before any network contact.
-for _requested in "${profiles[@]}"; do
+# An explicitly requested prod profile is gated here, before any network contact.
+for _requested in ${profiles[@]+"${profiles[@]}"}; do
   if [ "${_requested}" = "prod" ]; then
     require_prod_gate
   fi
@@ -140,25 +149,33 @@ derive_app_profile() {
 }
 
 selected=()
-for _file in "${candidates[@]}"; do
+for _file in ${candidates[@]+"${candidates[@]}"}; do
   derive_app_profile "$(basename "${_file}")"
   if [ -z "${_app}" ] || [ -z "${_profile}" ]; then
     warn "ignoring '${_file}': filename does not match <app>-<profile>-secrets.json"
     continue
   fi
+
+  # Selection first: a file whose profile is not being loaded is skipped before
+  # any gate is evaluated, so a prod file sitting next to the dev ones never
+  # affects a plain dev run.
+  _selected=0
+  if [ "${#profiles[@]}" -eq 0 ]; then
+    _selected=1
+  else
+    for _p in ${profiles[@]+"${profiles[@]}"}; do
+      if [ "${_p}" = "${_profile}" ]; then
+        _selected=1
+        break
+      fi
+    done
+  fi
+  [ "${_selected}" -eq 1 ] || continue
+
   if [ "${_profile}" = "prod" ]; then
     require_prod_gate
   fi
-  if [ "${#profiles[@]}" -eq 0 ]; then
-    selected+=("${_file}")
-    continue
-  fi
-  for _p in "${profiles[@]}"; do
-    if [ "${_p}" = "${_profile}" ]; then
-      selected+=("${_file}")
-      break
-    fi
-  done
+  selected+=("${_file}")
 done
 
 [ "${#selected[@]}" -gt 0 ] || die "no secret files matched profile(s) '${profiles_label}' in '${SECRETS_DIR}'"
@@ -171,7 +188,11 @@ wait_for_vault() {
     _out="$(vault status -format=json 2>&1)" && _rc=0 || _rc=$?
     if [ "${_rc}" -eq 0 ]; then
       _sealed="$(printf '%s' "${_out}" | jq -r 'if has("sealed") then .sealed else "unknown" end' 2>/dev/null || printf 'unknown')"
-      log "vault reachable and unsealed at ${VAULT_ADDR} (status.sealed=${_sealed})"
+      if [ "${_sealed}" = "false" ]; then
+        log "vault reachable and unsealed at ${VAULT_ADDR}"
+      else
+        log "vault reachable at ${VAULT_ADDR} (status.sealed=${_sealed})"
+      fi
       return 0
     fi
     # exit 1 = not answering yet (dev server still booting), exit 2 = sealed:
@@ -195,7 +216,7 @@ loaded=0
 skipped=0
 failed=0
 
-for _file in "${selected[@]}"; do
+for _file in ${selected[@]+"${selected[@]}"}; do
   _base="$(basename "${_file}")"
   derive_app_profile "${_base}"
   _vault_path="secret/${_app}/${_profile}"
@@ -210,20 +231,28 @@ for _file in "${selected[@]}"; do
   # Controller ruling (binding): the Vault CLI's `@file` sugar parses K=V lines,
   # NOT JSON, so `vault kv put <path> @file.json` fails on `{"key": "value"}`
   # lines. Every entry of the validated JSON is therefore converted into a
-  # single `key=value` argument via jq — same payload, JSON-safe, argv-based.
+  # single `key=value` argument. jq base64-encodes each pair and bash decodes it
+  # again, so one pair stays ONE argv element even when the value contains '='
+  # or a literal newline (a plain read over `jq -r` output would split such a
+  # value into a second, '='-less argument that `vault kv put` rejects).
+  if ! _b64="$(jq -r 'to_entries[] | ("\(.key)=\(.value|tostring)" | @base64)' "${_file}")"; then
+    die "could not read key/value pairs from ${_file} with jq"
+  fi
   _kv_pairs=()
-  while IFS= read -r _pair; do
-    [ -n "${_pair}" ] || continue
-    _kv_pairs+=("${_pair}")
-  done <<< "$(jq -r 'to_entries[] | "\(.key)=\(.value|tostring)"' "${_file}")"
+  while IFS= read -r _line; do
+    [ -n "${_line}" ] || continue
+    _kv_pairs+=("$(printf '%s' "${_line}" | base64 -d)")
+  done <<< "${_b64}"
 
   if [ "${#_kv_pairs[@]}" -eq 0 ]; then
-    warn "no key/value pairs derived from ${_base}; nothing to write"
-    failed=$(( failed + 1 ))
+    log "skip ${_vault_path}: ${_base} holds no key/value pairs (nothing to write)"
+    skipped=$(( skipped + 1 ))
     continue
   fi
 
   # Idempotency: an existing path is left untouched and reported as skipped.
+  # Inside the else branch `$?` is still the status of the condition command
+  # (`vault kv get`), which is how the exit code is classified below.
   if vault kv get "${_vault_path}" >/dev/null 2>&1; then
     log "skip ${_vault_path} (already present)"
     skipped=$(( skipped + 1 ))
@@ -237,7 +266,7 @@ for _file in "${selected[@]}"; do
       continue
     fi
 
-    if _put_out="$(vault kv put "${_vault_path}" "${_kv_pairs[@]}" 2>&1)"; then
+    if _put_out="$(vault kv put "${_vault_path}" ${_kv_pairs[@]+"${_kv_pairs[@]}"} 2>&1)"; then
       log "loaded ${_vault_path} from ${_base} (${#_kv_pairs[@]} keys)"
       loaded=$(( loaded + 1 ))
     else
