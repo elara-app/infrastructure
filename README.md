@@ -150,6 +150,10 @@ You only need a `.env` at all when you want to change something compose reads, n
 Editable-but-optional keys are the numeric `SERVER_PORT_*`, `SPRING_DATASOURCE_*` and
 `SPRING_RABBITMQ_*` values, plus `CONFIG_GIT_URI`/`CONFIG_GIT_DEFAULT_LABEL` and `TZ`.
 
+Compose never sets `SPRING_PROFILES_ACTIVE`: the three profile-reading services
+(`api-gateway`, `inventory-service`, `unit-of-measure-service`) already default to
+`SPRING_PROFILES_ACTIVE=dev` in their own `application.yml`, so no env var is needed.
+
 ### Start order
 
 `depends_on: {condition: service_healthy, restart: true}` already encodes the order —
@@ -183,8 +187,9 @@ between `vault` and the business services (see "Vault bootstrap under compose" a
 
 `5432` is deliberately **not** published: Postgres is reachable on `elara-net` only, and
 `docker compose exec postgres-inventory pg_isready -U postgres -d inventory_db` is the way
-to check it. Every service also declares `expose`, so the ports exist inside the network
-regardless of what is published.
+to check it. Every service also declares `expose`, documenting the in-network port for
+parity with the image's EXPOSE; it is documentation only — on a user-defined bridge
+containers reach each other regardless of EXPOSE.
 
 ### The nine services
 
