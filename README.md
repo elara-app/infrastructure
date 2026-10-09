@@ -1,8 +1,8 @@
 # Elara Local Infrastructure
 
 Local orchestration repo (no application code): Postgres multi-database bootstrap, the
-idempotent Vault secret loader, and the environment contract that Etapa-03's
-`docker-compose.yml` wires into the containers.
+idempotent Vault secret loader, `compose.yml` for the whole 9-service stack, and the
+environment contract that compose wires into the containers.
 
 See `../docs/ETAPA-02-infra-secretos.md` for the plan and `../docs/ETAPA-03-contenerizacion.md`
 for the containerisation stage that consumes these files (both live in the `docs` repo
@@ -14,6 +14,7 @@ next to this one, not inside it).
 | --- | --- |
 | `postgres/init-multiple-dbs.sh` | Creates every database the services need, idempotently. |
 | `scripts/setup-vault.sh` | Loads `service-secrets/*.json` into Vault (KV v2), idempotently. |
+| `compose.yml` | The 9-service stack on `elara-net` (5 Java builds + infra images). |
 | `.env.example` | The full environment contract (local-host dev defaults). |
 
 ## Postgres bootstrap (`postgres/init-multiple-dbs.sh`)
@@ -35,6 +36,8 @@ second pass. Names are comma separated, whitespace tolerant
 (`POSTGRES_MULTIPLE_DATABASES="a , b"` creates `a` and `b`), and only plain identifiers
 are accepted — anything else aborts before the SQL is built. If `POSTGRES_DB` is unset the
 official image creates a database named after `POSTGRES_USER` instead, so always set it.
+`compose.yml` mounts the script into `/docker-entrypoint-initdb.d/` of **both** Postgres
+containers, so each of them creates the second database itself.
 
 ## Vault secrets (`scripts/setup-vault.sh`)
 
@@ -69,6 +72,31 @@ Behaviour:
   `--profiles dev,test` select what gets loaded; files of other profiles (including prod
   files kept on disk by the DEV-ONLY policy) are simply not selected.
 
+### Vault bootstrap under compose (one-shot)
+
+The stack has **no tenth service** for this: `compose.yml` keeps the nine services the
+plan mandates, so the loader runs once from the host against the `vault` service.
+
+```bash
+docker compose up -d vault                    # dev mode: unsealed, token from .env
+export VAULT_ADDR=http://localhost:8200       # host side = the published port 8200
+export VAULT_TOKEN=$VAULT_DEV_ROOT_TOKEN_ID   # or the literal dev root token
+SECRETS_DIR=../centralized-configuration/service-secrets \
+PROFILES=dev ./scripts/setup-vault.sh
+```
+
+It is a one-shot and idempotent (existing paths are reported as skipped), so re-running
+never overwrites anything. Run it **before** `inventory-service` and
+`unit-of-measure-service`: both import `optional:vault://secret/<app>/dev` with
+`fail-fast: false`, so they tolerate an empty Vault and still come up — but ETAPA-04's E4
+(`vault kv get secret/<app>/dev`, expecting the 2/2 dev keys) only passes once the loader
+has run.
+
+The script needs `bash`, `vault`, `jq` AND `base64`. The official `hashicorp/vault` images
+ship none of `bash`/`jq`/`base64`, so a `docker compose run` equivalent must be built on an
+image that provides all four (for example `alpine` with `apk add bash vault jq`) rather
+than on `hashicorp/vault` — running it from the host, as above, avoids that entirely.
+
 ## DEV-ONLY policy and prod gating
 
 By default only `*-dev-secrets.json` files are loaded, against a local Vault dev server.
@@ -81,38 +109,147 @@ The values in `centralized-configuration/service-secrets/` are dev-only credenti
 (`postgres/postgres` + `elara/elara`) and are safe to version; real secrets belong in
 Vault only.
 
-## Etapa-03 handover (intended container wiring)
+## Running the stack (compose)
 
-| Container | Image | Healthcheck |
+`compose.yml` starts all nine services on the `elara-net` bridge network. Every
+interpolated value is written `${VAR:-<container DNS default>}`, so the stack is correct
+with **no `.env` at all** — the defaults already are the compose service names.
+
+```bash
+docker compose config            # validate the file offline: no daemon needed
+docker compose up -d --build     # build the five images and start everything (needs the daemon)
+docker compose ps                # per-service state and health
+docker compose logs <service> --tail=100
+docker compose down -v           # stop and drop the pgdata-* volumes
+```
+
+### `.env` is optional — and the loopback keys are a trap
+
+`cp .env.example .env` is optional: without it the compose defaults point at
+`config-service:8888`, `discovery-service:8761`, `postgres-inventory`/`postgres-uom:5432`,
+`rabbitmq:5672` and `vault:8200`.
+
+Compose auto-loads `.env` from this directory, and **`.env` beats the compose defaults**.
+`.env.example` is the *host-run* contract, so four of its keys are loopback values meant
+for running the pieces directly on a machine: `CONFIG_URI`, `EUREKA_URI`, `VAULT_URI` and
+`SPRING_RABBITMQ_HOST`. A verbatim copy next to `compose.yml` injects those loopbacks into
+the containers, where `localhost` is the container itself and not the sibling service: the
+business services then cannot reach the config server, Eureka, the broker or Vault, their
+health endpoint reports `DOWN` (HTTP 503), and `api-gateway` waits forever on its
+`depends_on`.
+
+So either create no `.env` at all, or create one with just the keys you really want to
+override and leave those four out (the apps' own YAML defaults are already the loopback
+values you would be re-declaring). Safe keys to override: `POSTGRES_USER`,
+`POSTGRES_PASSWORD`, `POSTGRES_MULTIPLE_DATABASES`, `RABBITMQ_DEFAULT_USER`,
+`RABBITMQ_DEFAULT_PASS`, `VAULT_DEV_ROOT_TOKEN_ID`, `TZ`, `CONFIG_GIT_URI`,
+`CONFIG_GIT_DEFAULT_LABEL`, and the numeric `SERVER_PORT_*`, `SPRING_DATASOURCE_*` and
+`SPRING_RABBITMQ_*` values.
+
+### Start order
+
+`depends_on: {condition: service_healthy, restart: true}` already encodes the order —
+infra (both Postgres, RabbitMQ, Vault) → `discovery-service` → `config-service` → the two
+business services → `api-gateway` — so a single `docker compose up -d --build` is safe.
+Step by step, if you prefer to read the logs service by service, use the same order:
+
+```bash
+docker compose up -d --build postgres-inventory postgres-uom rabbitmq vault
+docker compose up -d --build discovery-service
+docker compose up -d --build config-service
+docker compose up -d --build inventory-service unit-of-measure-service
+docker compose up -d --build api-gateway
+```
+
+The Vault secret loader is the one thing `depends_on` cannot do: run it once from the host
+between `vault` and the business services (see "Vault bootstrap under compose" above).
+
+### Published ports
+
+| host port | service | note |
 | --- | --- | --- |
-| `postgres-inventory`, `postgres-uom` | `postgres:16-alpine` | `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` |
-| `rabbitmq` | `rabbitmq:3-management-alpine` | `rabbitmq-diagnostics ping` |
-| `vault` | `hashicorp/vault:1.16` (dev mode) | `vault status` |
+| `8888` | `config-service` | config endpoint `/<app>/<profile>` + `/actuator/health` |
+| `8761` | `discovery-service` | Eureka dashboard + `/eureka/apps` |
+| `8080` | `api-gateway` | the only public entry point (`/api/v1/...`, `/inventory-service/...`) |
+| `5672` | `rabbitmq` | AMQP (dev) |
+| `15672` | `rabbitmq` | management UI/API (dev) |
+| `8200` | `vault` | dev-mode Vault (dev) |
+| `127.0.0.1:8081` | `inventory-service` | debug only, loopback-bound |
+| `127.0.0.1:8082` | `unit-of-measure-service` | debug only, loopback-bound |
 
-- Mount `postgres/init-multiple-dbs.sh` into `/docker-entrypoint-initdb.d/` of both
-  Postgres containers (the script creates the second database itself).
-- Feed the containers the env names of `.env.example`: `POSTGRES_USER`,
-  `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_MULTIPLE_DATABASES`,
-  `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`, `VAULT_DEV_ROOT_TOKEN_ID`,
-  `VAULT_ADDR`, `VAULT_URI`, `VAULT_TOKEN`, `SPRING_CLOUD_VAULT_TOKEN`,
-  `CONFIG_GIT_URI`, `CONFIG_URI`, `EUREKA_URI`, `SERVER_PORT_*`,
-  `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`, `SPRING_RABBITMQ_HOST`,
-  `SPRING_RABBITMQ_PORT`, `SPRING_RABBITMQ_USERNAME`, `SPRING_RABBITMQ_PASSWORD`,
-  plus the per-service `SPRING_DATASOURCE_URL` and `SERVER_PORT`.
-- The values annotated `container DNS in compose` in `.env.example` are loopback
-  defaults and must be overridden inside the container network:
-  `VAULT_ADDR`/`VAULT_URI` → `http://vault:8200`, `CONFIG_URI` → `http://config-service:8888`,
-  `EUREKA_URI` → `http://discovery-service:8761/eureka/`, `SPRING_RABBITMQ_HOST` → `rabbitmq`.
-- Run `scripts/setup-vault.sh` as a one-shot job against the `vault` service before the
-  business services start (it is idempotent and skips paths that already exist). The job
-  image must provide `bash`, `vault`, `jq` AND `base64` — the official `hashicorp/vault`
-  images ship neither `jq`, `bash` nor `base64`, so build the job on an image that does
-  (for example `alpine` with `apk add bash vault jq`) rather than on `hashicorp/vault`.
+`5432` is deliberately **not** published: Postgres is reachable on `elara-net` only, and
+`docker compose exec postgres-inventory pg_isready -U postgres -d inventory_db` is the way
+to check it. Every service also declares `expose`, so the ports exist inside the network
+regardless of what is published.
+
+### The nine services
+
+| service | image / build | ports | healthcheck |
+| --- | --- | --- | --- |
+| `config-service` | `build: ../config-service` | `8888:8888` | `curl -f http://localhost:8888/actuator/health` (start_period 90s) |
+| `discovery-service` | `build: ../discovery-service` | `8761:8761` | `curl -f http://localhost:8761/actuator/health` (60s) |
+| `api-gateway` | `build: ../api-gateway` | `8080:8080` | `curl -f http://localhost:8080/actuator/health` (60s) |
+| `inventory-service` | `build: ../inventory-service` | `127.0.0.1:8081:8081` | `curl -f http://localhost:8081/actuator/health` (90s) |
+| `unit-of-measure-service` | `build: ../unit-of-measure-service` | `127.0.0.1:8082:8082` | `curl -f http://localhost:8082/actuator/health` (90s) |
+| `postgres-inventory` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
+| `postgres-uom` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
+| `rabbitmq` | `rabbitmq:3-management-alpine` | `5672:5672`, `15672:15672` | `rabbitmq-diagnostics ping` (40s) |
+| `vault` | `hashicorp/vault:1.16` (dev) | `8200:8200` | `vault status` (20s) |
+
+The five Java images are built from the sibling repos (`build: ../<service>`), so all five
+`Dockerfile`s and `.dockerignore`s from Etapa-03 must exist before `up --build`. Both
+Postgres containers persist to the named volumes `pgdata-inventory` / `pgdata-uom`, and
+both mount `./postgres/init-multiple-dbs.sh` into `/docker-entrypoint-initdb.d/`.
+
+The env names each container reads are the ones documented in `.env.example`
+(`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_MULTIPLE_DATABASES`,
+`RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`, `VAULT_DEV_ROOT_TOKEN_ID`,
+`CONFIG_GIT_URI`, `SERVER_PORT_*`, `CONFIG_URI`, `EUREKA_URI`, `VAULT_URI`, `VAULT_TOKEN`,
+`SPRING_CLOUD_VAULT_TOKEN`, `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`), but with
+container DNS values instead of loopback: `http://config-service:8888`,
+`http://discovery-service:8761/eureka/`, `http://vault:8200`, `rabbitmq`,
+`jdbc:postgresql://postgres-<inventory|uom>:5432/<inventory_db|unit_of_measure_db>`.
+`VAULT_TOKEN` and `SPRING_CLOUD_VAULT_TOKEN` are the I-06 double mapping: both are fed
+from `VAULT_DEV_ROOT_TOKEN_ID`, so the YAML placeholder and Boot's relaxed binding can
+never drift into a 403. The vault container keeps its own literal
+`VAULT_ADDR=http://127.0.0.1:8200`, because its healthcheck runs `vault status` inside the
+container and the Vault CLI would otherwise default to `https`.
+
+### Memory and JVM sizing
+
+`mem_limit` is `512M` for `api-gateway`, `inventory-service` and `unit-of-measure-service`,
+`256M` for `config-service`, `discovery-service`, both Postgres containers and `rabbitmq`,
+and `128M` for `vault`. Each of the five Java services gets exactly
+`JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75` and no other JVM flag, so the JVM sizes its
+heap from the container limit at startup (75% of `mem_limit`) — tune `mem_limit`, never
+`-Xmx`, and note that the Dockerfiles keep no hardcoded heap of their own. All nine
+services run with `restart: unless-stopped`.
+
+### Config source (`CONFIG_GIT_URI`)
+
+`config-service` clones from `CONFIG_GIT_URI`, whose default is `/config-repo` — a
+read-only bind mount of `../centralized-configuration`, relative to `compose.yml`. JGit
+only reads that repo and clones it into the container's own basedir, so `:ro` is enough,
+and the stack works offline with no GitHub credentials. To clone from GitHub or from
+another branch instead, set in `.env`:
+
+```bash
+CONFIG_GIT_URI=https://github.com/elara-app/centralized-configuration.git
+CONFIG_GIT_DEFAULT_LABEL=main      # branch the Config Server clones
+```
+
+`CONFIG_GIT_DEFAULT_LABEL` maps to `SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL` and
+matches `default-label: main` in `config-service/application.yml`. The port of
+`discovery-service` is hardcoded (`server.port: 8761`, no placeholder in its
+`application.yml`), so `SERVER_PORT_DISCOVERY` is belt-and-braces there.
 
 ## Verification status
 
-This stage verifies with deterministic local proofs only: `bash -n`, `jq empty`, git
-mode checks, and mocked `vault`/`psql` CLIs that exercise the retry, idempotency and
-failure paths. Live evidence (Vault healthy, `vault kv get secret/<app>/dev` 2/2,
-`SELECT 1` against both databases) is **deferred to ETAPA-04 (E3/E6/E7)** because this
-development machine has no Docker daemon.
+This stage verifies with deterministic offline proofs only: `bash -n`, `jq empty`, git
+mode checks, mocked `vault`/`psql` CLIs that exercise the retry, idempotency and failure
+paths, plus `docker compose config` (which needs no daemon) over the whole `compose.yml`
+and `python3 -c "yaml.safe_load(...)"` structural checks of the same file. Compose is never
+allowed to reach the daemon here: image builds (`docker build`) and container runtime
+verification are **deferred to ETAPA-04 (E0/E1)**, as is the live evidence (Vault healthy,
+`vault kv get secret/<app>/dev` 2/2, `SELECT 1` against both databases — E3/E6/E7), because
+this development machine has no Docker daemon.
