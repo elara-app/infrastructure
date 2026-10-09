@@ -89,8 +89,9 @@ It is a one-shot and idempotent (existing paths are reported as skipped), so re-
 never overwrites anything. Run it **before** `inventory-service` and
 `unit-of-measure-service`: both import `optional:vault://secret/<app>/dev` with
 `fail-fast: false`, so they tolerate an empty Vault and still come up — but ETAPA-04's E4
-(`vault kv get secret/<app>/dev`, expecting the 2/2 dev keys) only passes once the loader
-has run.
+(`vault kv get secret/<app>/dev`) only passes once the loader has run, and it must assert
+all 4 keys each service's dev secret carries (spring.datasource.username/password +
+spring.rabbitmq.username/password).
 
 The script needs `bash`, `vault`, `jq` AND `base64`. The official `hashicorp/vault` images
 ship none of `bash`/`jq`/`base64`, so a `docker compose run` equivalent must be built on an
@@ -260,5 +261,6 @@ paths, plus `docker compose config` (which needs no daemon) over the whole `comp
 and `python3 -c "yaml.safe_load(...)"` structural checks of the same file. Compose is never
 allowed to reach the daemon here: image builds (`docker build`) and container runtime
 verification are **deferred to ETAPA-04 (E0/E1)**, as is the live evidence (Vault healthy,
-`vault kv get secret/<app>/dev` 2/2, `SELECT 1` against both databases — E3/E6/E7), because
+`vault kv get secret/<app>/dev` returning all 4 keys of each service's dev secret,
+`SELECT 1` against both databases — E3/E6/E7), because
 this development machine has no Docker daemon.
