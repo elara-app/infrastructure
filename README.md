@@ -15,7 +15,7 @@ next to this one, not inside it).
 | `postgres/init-multiple-dbs.sh` | Creates every database the services need, idempotently. |
 | `scripts/setup-vault.sh` | Loads `service-secrets/*.json` into Vault (KV v2), idempotently. |
 | `compose.yml` | The 9-service stack on `elara-net` (5 Java builds + infra images). |
-| `.env.example` | The full environment contract (local-host dev defaults). |
+| `.env.example` | The full environment contract. Compose-safe defaults: copying it verbatim keeps compose's container DNS.
 
 ## Postgres bootstrap (`postgres/init-multiple-dbs.sh`)
 
@@ -78,7 +78,7 @@ The stack has **no tenth service** for this: `compose.yml` keeps the nine servic
 plan mandates, so the loader runs once from the host against the `vault` service.
 
 ```bash
-docker compose up -d vault                    # dev mode: unsealed, token from .env
+docker compose up -d vault        # dev mode: unsealed, root token from .env or the compose default
 export VAULT_ADDR=http://localhost:8200       # host side = the published port 8200
 export VAULT_TOKEN=$VAULT_DEV_ROOT_TOKEN_ID   # or the literal dev root token
 SECRETS_DIR=../centralized-configuration/service-secrets \
@@ -123,28 +123,32 @@ docker compose logs <service> --tail=100
 docker compose down -v           # stop and drop the pgdata-* volumes
 ```
 
-### `.env` is optional — and the loopback keys are a trap
+### `.env` is optional — and now safe to copy
 
-`cp .env.example .env` is optional: without it the compose defaults point at
+`cp .env.example .env` is safe for compose: without it the compose defaults point at
 `config-service:8888`, `discovery-service:8761`, `postgres-inventory`/`postgres-uom:5432`,
-`rabbitmq:5672` and `vault:8200`.
+`rabbitmq:5672` and `vault:8200`, and with it you get exactly the same — the four keys that
+are *host-loopback values* are **commented out** in `.env.example`, so the copy cannot
+override compose's container DNS defaults.
 
-Compose auto-loads `.env` from this directory, and **`.env` beats the compose defaults**.
-`.env.example` is the *host-run* contract, so four of its keys are loopback values meant
-for running the pieces directly on a machine: `CONFIG_URI`, `EUREKA_URI`, `VAULT_URI` and
-`SPRING_RABBITMQ_HOST`. A verbatim copy next to `compose.yml` injects those loopbacks into
-the containers, where `localhost` is the container itself and not the sibling service: the
-business services then cannot reach the config server, Eureka, the broker or Vault, their
-health endpoint reports `DOWN` (HTTP 503), and `api-gateway` waits forever on its
-`depends_on`.
+Compose auto-loads `.env` from this directory, and `.env` beats the compose defaults. That
+is precisely why those four keys (`CONFIG_URI`, `EUREKA_URI`, `VAULT_URI`,
+`SPRING_RABBITMQ_HOST`) are commented out rather than active: if you uncomment them (or
+copy them in from somewhere else), the loopbacks are injected into the containers, where
+`localhost` is the container itself and not the sibling service — the business services
+then cannot reach the config server, Eureka, the broker or Vault, their health endpoint
+reports `DOWN` (HTTP 503), and `api-gateway` waits forever on its `depends_on`. Leave them
+commented for `docker compose`; they are what you uncomment when you run the services
+**directly on the host** (IDEs, scripts, published container ports).
 
-So either create no `.env` at all, or create one with just the keys you really want to
-override and leave those four out (the apps' own YAML defaults are already the loopback
-values you would be re-declaring). Safe keys to override: `POSTGRES_USER`,
-`POSTGRES_PASSWORD`, `POSTGRES_MULTIPLE_DATABASES`, `RABBITMQ_DEFAULT_USER`,
-`RABBITMQ_DEFAULT_PASS`, `VAULT_DEV_ROOT_TOKEN_ID`, `TZ`, `CONFIG_GIT_URI`,
-`CONFIG_GIT_DEFAULT_LABEL`, and the numeric `SERVER_PORT_*`, `SPRING_DATASOURCE_*` and
-`SPRING_RABBITMQ_*` values.
+You only need a `.env` at all when you want to change something compose reads, namely:
+
+- `VAULT_DEV_ROOT_TOKEN_ID` (feeds the dev server plus `VAULT_TOKEN`/`SPRING_CLOUD_VAULT_TOKEN` on both business services),
+- `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_MULTIPLE_DATABASES`,
+- `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`.
+
+Editable-but-optional keys are the numeric `SERVER_PORT_*`, `SPRING_DATASOURCE_*` and
+`SPRING_RABBITMQ_*` values, plus `CONFIG_GIT_URI`/`CONFIG_GIT_DEFAULT_LABEL` and `TZ`.
 
 ### Start order
 

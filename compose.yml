@@ -4,10 +4,10 @@
 #   bring-up (needs the daemon):     docker compose up -d --build
 #
 # Every interpolated value carries a `${VAR:-default}`, so the stack is correct
-# with no `.env` at all; `.env` only overrides. Do NOT copy `.env.example`
-# verbatim next to this file: four of its keys (CONFIG_URI, EUREKA_URI,
-# VAULT_URI, SPRING_RABBITMQ_HOST) are host-loopback values that would beat
-# these defaults inside the containers — see README.md, ".env is optional".
+# with no `.env` at all; `.env` only overrides. The four host-only keys that would
+# override these defaults (CONFIG_URI, EUREKA_URI, VAULT_URI, SPRING_RABBITMQ_HOST)
+# are commented out in `.env.example`, so a verbatim `cp .env.example .env` cannot
+# beat the container DNS defaults below — see README.md, "`.env` is optional".
 # No Java service env value points at `localhost`/`127.0.0.1`: siblings are
 # reached by their compose service name (DNS on `elara-net`). There is
 # deliberately no tenth service — the Vault secret bootstrap stays a documented
