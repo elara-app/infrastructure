@@ -219,6 +219,11 @@ for app in inventory-service unit-of-measure-service; do
   vault kv get -format=json "secret/$app/dev" | jq -e '.data.data | has("spring.datasource.username") and has("spring.datasource.password") and has("spring.rabbitmq.username") and has("spring.rabbitmq.password")'
 done
 # then re-verify the minimum: :8888/{app}/dev 200, Eureka == 3 applications, /api/v1/inventory/item/?page 200
+# NOTE (observed live): right after down/up the loader can fail attaching to the
+# freshly recreated network (`failed to set up container networking: network … not found`,
+# transient daemon race, not a compose bug). Recover with:
+#   sudo docker compose --profile bootstrap rm -f vault-loader
+# and retry the `up vault-loader` above — the loader is idempotent.
 ```
 
 OK: re-up reaches the same state — but ONLY AFTER the Vault one-shot: Vault dev mode is
