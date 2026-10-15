@@ -306,6 +306,27 @@ services:
     networks:
       - elara-net
 
+  # One-shot Vault bootstrap (profile-gated: hidden from the default 9-service
+  # stack; default `config`/`up` still render exactly 9). CLI 1.16 == server 1.16.
+  # Run: sudo docker compose --profile bootstrap up vault-loader
+  vault-loader:
+    build: ./vault-loader
+    profiles: ["bootstrap"]
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}}
+      SECRETS_DIR: /secrets
+      PROFILES: ${VAULT_LOAD_PROFILES:-dev}
+    volumes:
+      - ./scripts:/work/scripts:ro
+      - ../centralized-configuration/service-secrets:/secrets:ro
+    networks:
+      - elara-net
+    restart: "no"
+
 volumes:
   pgdata-inventory: {}
   pgdata-uom: {}
