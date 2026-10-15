@@ -1,4 +1,4 @@
-# Elara local stack — exactly 9 services on the `elara-net` bridge network.
+# Elara local stack — 9 services in the default render (10th, vault-loader, is profile-gated).
 #
 #   offline validation (no daemon):  docker compose config --quiet
 #   bring-up (needs the daemon):     docker compose up -d --build
@@ -10,8 +10,8 @@
 # beat the container DNS defaults below — see README.md, "`.env` is optional".
 # No Java service env value points at `localhost`/`127.0.0.1`: siblings are
 # reached by their compose service name (DNS on `elara-net`). There is
-# deliberately no tenth service — the Vault secret bootstrap stays a documented
-# one-shot host command (see README.md, "Vault bootstrap under compose").
+# deliberately no tenth service in the default stack — the bootstrap loader is
+# profile-gated (see README.md, "Vault bootstrap under compose").
 
 name: elara
 

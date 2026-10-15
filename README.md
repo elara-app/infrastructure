@@ -1,7 +1,7 @@
 # Elara Local Infrastructure
 
 Local orchestration repo (no application code): Postgres multi-database bootstrap, the
-idempotent Vault secret loader, `compose.yml` for the whole 9-service stack, and the
+idempotent Vault secret loader, `compose.yml` for the whole default 9-service stack, and the
 environment contract that compose wires into the containers.
 
 See `../docs/ETAPA-02-infra-secretos.md` for the plan and `../docs/ETAPA-03-contenerizacion.md`
@@ -15,7 +15,7 @@ next to this one, not inside it).
 | `postgres/init-multiple-dbs.sh` | Creates every database the services need, idempotently. |
 | `scripts/setup-vault.sh` | Loads `service-secrets/*.json` into Vault (KV v2), idempotently. |
 | `vault-loader/Dockerfile` | One-shot Vault bootstrap image (vault 1.16 CLI + bash/jq/base64). |
-| `compose.yml` | The 9-service stack on `elara-net` (5 Java builds + infra images). |
+| `compose.yml` | The default 9-service stack on `elara-net` (5 Java builds + infra images). |
 | `.env.example` | The full environment contract. Compose-safe defaults: copying it verbatim keeps compose's container DNS.
 
 ## Postgres bootstrap (`postgres/init-multiple-dbs.sh`)
@@ -123,7 +123,7 @@ Vault only.
 
 ## Running the stack (compose)
 
-`compose.yml` starts all nine services on the `elara-net` bridge network. Every
+`compose.yml` starts all nine services of the default stack on the `elara-net` bridge network. Every
 interpolated value is written `${VAR:-<container DNS default>}`, so the stack is correct
 with **no `.env` at all** — the defaults already are the compose service names.
 
@@ -204,7 +204,7 @@ to check it. Every service also declares `expose`, documenting the in-network po
 parity with the image's EXPOSE; it is documentation only — on a user-defined bridge
 containers reach each other regardless of EXPOSE.
 
-### The nine services
+### The nine default services
 
 | service | image / build | ports | healthcheck |
 | --- | --- | --- | --- |
