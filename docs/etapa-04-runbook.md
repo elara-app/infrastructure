@@ -81,7 +81,7 @@ docker compose exec postgres-inventory psql -U postgres -d inventory_db -c "SELE
 docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -c "SELECT 1"
 # RabbitMQ (credentials are elara/elara, NOT guest)
 timeout 2 bash -c '</dev/tcp/localhost/5672' && echo "5672 OPEN"
-curl -s -u elara:elara http://localhost:15672/api/overview | jq '{rabbit_version: .rabbit_version}'
+curl -s -u elara:elara http://localhost:15672/api/overview | jq '{rabbitmq_version: .rabbitmq_version}'
 # Vault
 VAULT_ADDR=http://localhost:8200 VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}" vault status | grep -E "Sealed|Version"
 # Actuator
@@ -163,7 +163,7 @@ or `infra/scripts/setup-vault.sh` on the host — idempotent), check `VAULT_TOKE
 ## E7 — RabbitMQ
 
 ```bash
-curl -s -u elara:elara http://localhost:15672/api/overview | jq '{rabbit_version, listeners}'
+curl -s -u elara:elara http://localhost:15672/api/overview | jq '{rabbitmq_version, listeners}'
 curl -s -u elara:elara http://localhost:15672/api/connections | jq 'length'   # expect >= 2 with bus-amqp
 curl -s -u elara:elara "http://localhost:15672/api/exchanges/%2F/springCloudBus" | jq -r '.name'   # springCloudBus
 ```
