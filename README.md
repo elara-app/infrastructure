@@ -14,6 +14,7 @@ next to this one, not inside it).
 | --- | --- |
 | `postgres/init-multiple-dbs.sh` | Creates every database the services need, idempotently. |
 | `scripts/setup-vault.sh` | Loads `service-secrets/*.json` into Vault (KV v2), idempotently. |
+| `vault-loader/Dockerfile` | One-shot Vault bootstrap image (vault 1.16 CLI + bash/jq/base64). |
 | `compose.yml` | The 9-service stack on `elara-net` (5 Java builds + infra images). |
 | `.env.example` | The full environment contract. Compose-safe defaults: copying it verbatim keeps compose's container DNS.
 
@@ -74,11 +75,19 @@ Behaviour:
 
 ### Vault bootstrap under compose (one-shot)
 
-The stack has **no tenth service** for this: `compose.yml` keeps the nine services the
-plan mandates, so the loader runs once from the host against the `vault` service.
+The default stack renders nine services: a profile-gated `vault-loader` helper exists
+but stays hidden from the default `config`/`up` render (default render is still exactly
+9 services). Run it as a container one-shot against the `vault` service:
 
 ```bash
 docker compose up -d vault        # dev mode: unsealed, root token from .env or the compose default
+sudo docker compose --profile bootstrap up vault-loader   # waits for `vault` healthy via depends_on, loads `dev` by default
+```
+
+Profile selection: `VAULT_LOAD_PROFILES=test` in `.env` or `--profiles dev,test` appended
+to the run command changes what gets loaded. Host one-shot kept as alternative:
+
+```bash
 export VAULT_ADDR=http://localhost:8200       # host side = the published port 8200
 export VAULT_TOKEN=$VAULT_DEV_ROOT_TOKEN_ID   # or the literal dev root token
 SECRETS_DIR=../centralized-configuration/service-secrets \
@@ -94,9 +103,11 @@ all 4 keys each service's dev secret carries (spring.datasource.username/passwor
 spring.rabbitmq.username/password).
 
 The script needs `bash`, `vault`, `jq` AND `base64`. The official `hashicorp/vault` images
-ship none of `bash`/`jq`/`base64`, so a `docker compose run` equivalent must be built on an
-image that provides all four (for example `alpine` with `apk add bash vault jq`) rather
-than on `hashicorp/vault` — running it from the host, as above, avoids that entirely.
+ship none of `bash`/`jq`/`base64`, and Alpine has no `vault` package, so the loader image
+(`vault-loader/Dockerfile`) is multi-stage: it COPYs `/bin/vault` from
+`hashicorp/vault:1.16` (CLI 1.16 == server 1.16) and runs `apk add bash jq coreutils`
+(`base64` ships in coreutils) on `alpine:3.21` — running the script from the host, as
+above, avoids that entirely.
 
 ## DEV-ONLY policy and prod gating
 
@@ -170,8 +181,9 @@ docker compose up -d --build inventory-service unit-of-measure-service
 docker compose up -d --build api-gateway
 ```
 
-The Vault secret loader is the one thing `depends_on` cannot do: run it once from the host
-between `vault` and the business services (see "Vault bootstrap under compose" above).
+The Vault secret loader is the one thing `depends_on` cannot do for the business
+services: run the profile-gated one-shot (container or host) once between `vault` and
+the business services (see "Vault bootstrap under compose" above).
 
 ### Published ports
 

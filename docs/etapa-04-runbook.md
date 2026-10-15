@@ -50,9 +50,12 @@ docker compose up -d --build postgres-inventory postgres-uom rabbitmq vault   # 
 docker compose up -d --build discovery-service                                 # wait :8761/ 200 (<=90s)
 docker compose up -d --build config-service                                    # wait :8888/actuator/health (<=120s)
 # Vault one-shot BEFORE the business services (they tolerate empty Vault, E4/E6 do not):
-export VAULT_ADDR=http://localhost:8200
-export VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}"
-SECRETS_DIR=../centralized-configuration/service-secrets PROFILES=dev ./scripts/setup-vault.sh
+# Container path (primary — waits for `vault` healthy via depends_on, loads `dev` by default):
+sudo docker compose --profile bootstrap up vault-loader
+# Host alternative:
+# export VAULT_ADDR=http://localhost:8200
+# export VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}"
+# SECRETS_DIR=../centralized-configuration/service-secrets PROFILES=dev ./scripts/setup-vault.sh
 docker compose up -d --build inventory-service unit-of-measure-service          # Eureka registration, <=180s
 docker compose up -d --build api-gateway                                        # wait :8080/actuator/health
 docker compose ps
@@ -62,10 +65,11 @@ OK: every service `running` → `healthy`. FAIL: `restarting`/`exited` → `dock
 <svc> --tail=100`, R2 (stop only the failed layer; never `down -v` while diagnosing).
 
 Notes: service names are `postgres-inventory`/`postgres-uom` (there is no bare `postgres`);
-vault has **no** compose init service — the one-shot above is the mechanism. It requires
+vault has **no** compose init service in the default stack — the profile-gated `vault-loader`
+one-shot above is the mechanism (hidden from the default 9-service render). It requires
 `bash` + `vault` + `jq` + `base64` (coreutils) inside whatever executes it: either the host,
-or an alpine job image that first runs `apk add bash vault jq coreutils` (`base64` ships in
-coreutils).
+or the loader image, which COPYs `/bin/vault` from `hashicorp/vault:1.16` (Alpine has no
+`vault` package) and runs `apk add bash jq coreutils` (`base64` ships in coreutils).
 
 ## E3 — Infra health + actuator
 
@@ -153,7 +157,8 @@ done
 ```
 
 OK: `true` twice (each secret holds **4** keys: datasource user/pass + rabbit user/pass).
-FAIL 403/404 → re-run `infra/scripts/setup-vault.sh` (idempotent), check `VAULT_TOKEN`, R6.
+FAIL 403/404 → re-run the loader (`sudo docker compose --profile bootstrap up vault-loader`,
+or `infra/scripts/setup-vault.sh` on the host — idempotent), check `VAULT_TOKEN`, R6.
 
 ## E7 — RabbitMQ
 
@@ -204,10 +209,12 @@ matrix above + zero 503 + `docker compose logs` clean of `ERROR` for the five se
 docker compose down -v            # networks + volumes removed, zero elara residue
 docker compose up -d --build      # ordered start is handled by depends_on: service_healthy
 # Vault is IN-MEMORY dev mode: down -v empties it, and depends_on: service_healthy does NOT
-# wait for secret loading — re-run the one-shot and the E6 assertion BEFORE the three checks:
-export VAULT_ADDR=http://localhost:8200
-export VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}"
-SECRETS_DIR=../centralized-configuration/service-secrets PROFILES=dev ./scripts/setup-vault.sh
+# wait for secret loading — re-run the one-shot (container path) and the E6 assertion BEFORE the three checks:
+sudo docker compose --profile bootstrap up vault-loader
+# Host alternative:
+# export VAULT_ADDR=http://localhost:8200
+# export VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}"
+# SECRETS_DIR=../centralized-configuration/service-secrets PROFILES=dev ./scripts/setup-vault.sh
 for app in inventory-service unit-of-measure-service; do
   vault kv get -format=json "secret/$app/dev" | jq -e '.data.data | has("spring.datasource.username") and has("spring.datasource.password") and has("spring.rabbitmq.username") and has("spring.rabbitmq.password")'
 done
@@ -229,7 +236,7 @@ registration). FAIL → R8 (never destructive `system prune`; `down -v` only).
 | R3 | infra health | `docker compose restart <infra>`; re-export Vault token; check Java logs for ConfigClient/Vault/Eureka |
 | R4 | config 404/500 | check `CONFIG_GIT_URI`/`CONFIG_GIT_DEFAULT_LABEL` + mounted repo branch; `restart config-service` |
 | R5 | Eureka missing app | check `EUREKA_URI`; `restart` the client; wait 60s; re-poll |
-| R6 | Vault 403/404 | re-run `scripts/setup-vault.sh`; `vault kv get secret/<app>/dev`; restart the business service |
+| R6 | Vault 403/404 | re-run the loader (container one-shot, or `scripts/setup-vault.sh` on the host); `vault kv get secret/<app>/dev`; restart the business service |
 | R7 | gateway 503/404 | verify E5 green first; routes/`StripPrefix=3`; `restart api-gateway` |
 | R8 | re-up regression | `down -v`; strict up order; diff the changed yml/env |
 
