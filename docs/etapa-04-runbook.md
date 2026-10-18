@@ -254,7 +254,13 @@ sudo docker compose --profile bootstrap up vault-loader
 for app in inventory-service unit-of-measure-service; do
   vault kv get -format=json "secret/$app/dev" | jq -e '.data.data | has("spring.datasource.username") and has("spring.datasource.password") and has("spring.rabbitmq.username") and has("spring.rabbitmq.password")'
 done
-# Minimum re-checks, now including the startup seed:
+# Minimum re-checks, now including the startup seed.
+# up --wait returns when health is up, but Eureka registration and the gateway load
+# balancer need ~30-60s more: wait for the three apps before gateway checks.
+for i in $(seq 1 60); do
+  curl -fsS -H "Accept: application/json" http://localhost:8761/eureka/apps 2>/dev/null | jq -e '[.applications.application[].name] | sort == ["API-GATEWAY","INVENTORY-SERVICE","UNIT-OF-MEASURE-SERVICE"]' >/dev/null 2>&1 && { echo "eureka 3 apps OK"; break; }
+  sleep 3
+done
 curl -fsS http://localhost:8888/inventory-service/dev >/dev/null && echo "config OK"
 curl -fsS -H "Accept: application/json" http://localhost:8761/eureka/apps | jq -e '[.applications.application[].name] | sort == ["API-GATEWAY","INVENTORY-SERVICE","UNIT-OF-MEASURE-SERVICE"]' >/dev/null && echo "eureka OK"
 curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2' >/dev/null && echo "seed inventory OK"
