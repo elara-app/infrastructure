@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent multi-database bootstrap for the official postgres image.
-# Intended mount: /docker-entrypoint-initdb.d/init-multiple-dbs.sh (runs once on
-# an empty data directory). Safe to re-run: each DB is created only if absent.
+# Intended mount: /docker-entrypoint-initdb.d/init-multiple-dbs.sh (runs on
+# every container start, because PGDATA is a tmpfs that begins empty).
+# Safe to re-run: each DB is created only if absent.
 #
 # Edge case: if POSTGRES_DB is unset the official image creates a database named
 # after POSTGRES_USER instead, so the default 'inventory_db' below would not
