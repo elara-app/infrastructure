@@ -262,16 +262,19 @@ curl -fsS "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc"        
 curl -fsS "http://localhost:8080/api/v1/uom/status/?page=0&size=20"                 | jq -e '.page.totalElements == 3' >/dev/null && echo "seed statuses OK"
 # Ephemerality proof: insert a probe row, restart the Postgres pair (cascades to the
 # services and the gateway) and confirm the probe is gone while the seed is back.
+probe_ok=0
 curl -fsS -X POST http://localhost:8080/api/v1/inventory/item/ -H 'Content-Type: application/json' \
   -d '{"name":"E10 Ephemerality Probe","description":"temporary","baseUnitOfMeasureId":1,"standardCost":1.00,"unitPerPurchaseUom":1.00,"reorderPointQuantity":1.00}' >/dev/null
 curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 3' >/dev/null \
-  && echo "probe inserted (3 items)" || echo "FAIL: probe not inserted - ephemerality proof void"
+  && probe_ok=1 && echo "probe inserted (3 items)" \
+  || echo "FAIL: probe not inserted - ephemerality proof is void"
 sudo docker compose restart postgres-inventory postgres-uom
 for i in $(seq 1 24); do
-  if curl -fsS http://localhost:8080/actuator/health >/dev/null 2>&1 \
-    && curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2 and ([.content[].name] | index("E10 Ephemerality Probe") == null)' >/dev/null 2>&1 \
-    && curl -fsS "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2' >/dev/null 2>&1 \
-    && curl -fsS "http://localhost:8080/api/v1/uom/status/?page=0&size=20" | jq -e '.page.totalElements == 3' >/dev/null 2>&1; then
+  if [ "$probe_ok" = 1 ] \
+    && curl -fsS --max-time 10 http://localhost:8080/actuator/health >/dev/null 2>&1 \
+    && curl -fsS --max-time 10 "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2 and ([.content[].name] | index("E10 Ephemerality Probe") == null)' >/dev/null 2>&1 \
+    && curl -fsS --max-time 10 "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2' >/dev/null 2>&1 \
+    && curl -fsS --max-time 10 "http://localhost:8080/api/v1/uom/status/?page=0&size=20" | jq -e '.page.totalElements == 3' >/dev/null 2>&1; then
     echo "probe gone, seed back to 2/2/3"; break
   fi
   if [ "$i" = 24 ]; then echo "FAIL: not recovered in time or probe survived"; fi
