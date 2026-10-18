@@ -83,12 +83,16 @@ Restart semantics that go with ephemeral data:
 - `docker compose restart postgres-inventory` / `postgres-uom` also restarts the dependent
   service and the gateway (`depends_on: restart: true`), which re-creates the schema and
   re-runs the seed.
-- `docker compose stop` + `start`, `restart --no-deps`, a raw `docker restart`, an OOM kill
-  or a host reboot discard the tmpfs **without** restarting the services; the apps then
-  serve against a database with no tables until you run
+- Postgres-scoped operations that bypass that cascade — `restart --no-deps` on a Postgres
+  service, a raw `docker restart` of it, an OOM kill of it, or `docker compose stop
+  postgres-inventory postgres-uom` + `start` for those two — discard the tmpfs and leave
+  the business services running against a database with no tables until you run
   `docker compose restart inventory-service unit-of-measure-service` (or force-recreate
   them).
 - Restarting `vault` empties its in-memory store: re-run the profile-gated loader.
+- A host reboot or Docker daemon restart restarts every container by its
+  `restart: unless-stopped` policy, so the services rebuild the schema and re-seed by
+  themselves; only Vault's in-memory store stays empty, so re-run the loader as well.
 
 ## Vault secrets (`scripts/setup-vault.sh`)
 
