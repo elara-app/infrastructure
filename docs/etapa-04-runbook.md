@@ -62,7 +62,9 @@ docker compose ps
 ```
 
 OK: every service `running` → `healthy`. FAIL: `restarting`/`exited` → `docker compose logs
-<svc> --tail=100`, R2 (stop only the failed layer; never `down -v` while diagnosing).
+<svc> --tail=100`, R2 (stop only the failed layer). Do not stop or restart the Postgres
+containers casually: their tmpfs data is discarded and the services must restart to
+re-create the schema and reseed (see "Restart semantics" below).
 
 Notes: service names are `postgres-inventory`/`postgres-uom` (there is no bare `postgres`);
 vault has **no** compose init service in the default stack — the profile-gated `vault-loader`
@@ -88,10 +90,14 @@ VAULT_ADDR=http://localhost:8200 VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN_ID:-0000000
 for p in 8888 8761 8080; do curl -sf "http://localhost:$p/actuator/health" >/dev/null && echo "$p health 200"; done
 curl -sf http://localhost:8081/actuator/health >/dev/null && echo "8081 health 200"   # debug binding
 curl -sf http://localhost:8082/actuator/health >/dev/null && echo "8082 health 200"   # debug binding
+# Startup seed (dev profile): tables + demo rows exist with no manual SQL
+docker compose exec postgres-inventory psql -U postgres -d inventory_db -tAc "SELECT count(*) FROM inventory_item"    # 2
+docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom_status" # 3
+docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom"        # 2
 ```
 
-OK: 2× `accepting connections` + 2× `SELECT 1` → `1`; `5672 OPEN`; overview 200 with a version;
-`Sealed: false`; five health 200s. FAIL → R3 per component.
+OK: 2× `accepting connections` + 2× `SELECT 1` → `1` + seed counts `2/3/2`; `5672 OPEN`;
+overview 200 with a version; `Sealed: false`; five health 200s. FAIL → R3 per component.
 
 ## E4 — Config Server `:8888/{app}/{profile}`
 
@@ -198,18 +204,43 @@ path keeps the service segment and 404s; ETAPA-01 ruling + verification).
 
 ## E9 — Acta (one FAIL = FAIL)
 
-Build 5× (E1) + all `healthy` (`compose ps`) + PG 2× `SELECT 1` + `5672 OPEN` + overview 200 +
-`Sealed: false` + 2× `kv get` (4 keys each) + config health 200 + 3× config `200` + Eureka
-3 applications UP + health 200 on 8081/8082 (debug bindings) + direct/locator/explicit gateway
-matrix above + zero 503 + `docker compose logs` clean of `ERROR` for the five services.
+Build 5× (E1) + all `healthy` (`compose ps`) + PG 2× `SELECT 1` + seed counts `2/3/2` +
+`5672 OPEN` + overview 200 + `Sealed: false` + 2× `kv get` (4 keys each) + config health 200 +
+3× config `200` + Eureka 3 applications UP + health 200 on 8081/8082 (debug bindings) +
+direct/locator/explicit gateway matrix above + seed API rows (2 inventory items referencing
+uom 1/2, 2 uoms, 3 statuses) + zero 503 + `docker compose logs` clean of `ERROR` for the
+five services.
 
-## E10 — `down -v` + full re-up
+## Restart semantics (ephemeral data)
+
+Both Postgres data directories are tmpfs, so stopping or restarting those containers discards
+both databases; only a restart of the business services re-creates the schema and re-runs the
+startup seed (`db/dev/seed.sql`).
+
+- Cascading: `docker compose restart postgres-inventory` (or `postgres-uom`) also restarts
+  the dependent service and the gateway (`depends_on: restart: true`) — full recovery.
+- Non-cascading: `docker compose stop` + `start`, `restart --no-deps`, a raw `docker restart`,
+  an OOM kill or a host reboot wipe the tmpfs and leave the services running against a
+  database with no tables. Recover with
+  `docker compose restart inventory-service unit-of-measure-service` and re-wait for Eureka.
+- Restarting `vault` empties its in-memory store: re-run the loader one-shot (E6).
+- Restarting only a business service re-runs the seed idempotently against the still-present
+  tmpfs database (counts unchanged, no duplicates).
+
+## E10 — full reset and re-up
+
+The tmpfs data directory means a plain `docker compose down` already discards both databases,
+so the reset no longer needs `-v`; the `down -v` variant remains equivalent (the stack declares
+no named volumes to drop, and the profile-gated one-shot survives `down` as an orphan).
 
 ```bash
-docker compose down -v            # networks + volumes removed, zero elara residue
-docker compose up -d --build      # ordered start is handled by depends_on: service_healthy
-# Vault is IN-MEMORY dev mode: down -v empties it, and depends_on: service_healthy does NOT
-# wait for secret loading — re-run the one-shot (container path) and the E6 assertion BEFORE the three checks:
+docker compose down                     # variant A: enough to discard the tmpfs databases
+# docker compose down -v                # variant B: equivalent here
+docker compose --profile bootstrap rm -f vault-loader   # the one-shot does not stop with `down`
+docker compose up -d --build --wait     # ordered start via depends_on; blocks until healthy
+# Vault is IN-MEMORY dev mode: any down/up (and any vault restart) empties it, and
+# depends_on: service_healthy does NOT wait for secret loading — re-run the one-shot
+# (container path) and the E6 assertion BEFORE the minimum checks:
 sudo docker compose --profile bootstrap up vault-loader
 # Host alternative:
 # export VAULT_ADDR=http://localhost:8200
@@ -218,7 +249,15 @@ sudo docker compose --profile bootstrap up vault-loader
 for app in inventory-service unit-of-measure-service; do
   vault kv get -format=json "secret/$app/dev" | jq -e '.data.data | has("spring.datasource.username") and has("spring.datasource.password") and has("spring.rabbitmq.username") and has("spring.rabbitmq.password")'
 done
-# then re-verify the minimum: :8888/{app}/dev 200, Eureka == 3 applications, /api/v1/inventory/item/?page 200
+# Minimum re-checks, now including the startup seed:
+curl -fsS http://localhost:8888/inventory-service/dev >/dev/null && echo "config OK"
+curl -fsS -H "Accept: application/json" http://localhost:8761/eureka/apps | jq -e '[.applications.application[].name] | sort == ["API-GATEWAY","INVENTORY-SERVICE","UNIT-OF-MEASURE-SERVICE"]' >/dev/null && echo "eureka OK"
+curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2' >/dev/null && echo "seed inventory OK"
+curl -fsS "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc"            | jq -e '.page.totalElements == 2' >/dev/null && echo "seed uom OK"
+curl -fsS "http://localhost:8080/api/v1/uom/status/?page=0&size=20"                 | jq -e '.page.totalElements == 3' >/dev/null && echo "seed statuses OK"
+# Ephemerality proof: restart the Postgres pair (cascades to the services and gateway) and
+# repeat the three seed checks — the rows return to 2/2/3 even after API inserts.
+sudo docker compose restart postgres-inventory postgres-uom
 # NOTE (observed live): right after down/up the loader can fail attaching to the
 # freshly recreated network (`failed to set up container networking: network … not found`,
 # transient daemon race, not a compose bug). Recover with:
@@ -226,24 +265,25 @@ done
 # and retry the `up vault-loader` above — the loader is idempotent.
 ```
 
-OK: re-up reaches the same state — but ONLY AFTER the Vault one-shot: Vault dev mode is
-in-memory, so `down -v` leaves it empty, `depends_on` does not wait for the secrets, and
-without the re-run E6 fails (403/404) and the business services boot with missing secrets
-(the re-up itself takes ~2–4 min: config clone + JPA `ddl-auto: update` + Eureka
-registration). FAIL → R8 (never destructive `system prune`; `down -v` only).
+OK: re-up reaches the same state — seed counts `2/2/3` with no manual SQL — but ONLY AFTER
+the Vault one-shot: Vault dev mode is in-memory, so any down/up leaves it empty,
+`depends_on` does not wait for the secrets, and without the re-run E6 fails (403/404) and
+the business services boot with missing secrets (the re-up itself takes ~2–4 min: config
+clone + JPA `ddl-auto: update` + seed + Eureka registration). FAIL → R8 (never destructive
+`system prune`; `docker compose down` only).
 
 ## Rollback quick table (corrected)
 
 | id | trigger | action |
 |---|---|---|
 | R1 | build/test failure | stay in code; inspect `target/surefire-reports`; do not touch containers |
-| R2 | `restarting`/`exited` on up | `docker compose logs <svc> --tail=100`; stop only the failed layer; no `down -v` |
-| R3 | infra health | `docker compose restart <infra>`; re-export Vault token; check Java logs for ConfigClient/Vault/Eureka |
+| R2 | `restarting`/`exited` on up | `docker compose logs <svc> --tail=100`; stop only the failed layer; do not stop/restart Postgres casually (the tmpfs data is discarded) |
+| R3 | infra health | `docker compose restart <infra>` (a compose Postgres restart cascades to the dependent services; a raw `docker restart` does not — restart the business services to reseed); re-export Vault token; check Java logs for ConfigClient/Vault/Eureka |
 | R4 | config 404/500 | check `CONFIG_GIT_URI`/`CONFIG_GIT_DEFAULT_LABEL` + mounted repo branch; `restart config-service` |
 | R5 | Eureka missing app | check `EUREKA_URI`; `restart` the client; wait 60s; re-poll |
 | R6 | Vault 403/404 | re-run the loader (container one-shot, or `scripts/setup-vault.sh` on the host); `vault kv get secret/<app>/dev`; restart the business service |
 | R7 | gateway 503/404 | verify E5 green first; routes/`StripPrefix=3`; `restart api-gateway` |
-| R8 | re-up regression | `down -v`; strict up order; diff the changed yml/env |
+| R8 | re-up regression | `docker compose down` (discards the tmpfs data); strict up order; diff the changed yml/env |
 
 ## Corrections applied to the plan doc (ETAPA-04)
 
@@ -261,7 +301,11 @@ registration). FAIL → R8 (never destructive `system prune`; `down -v` only).
 
 Watch items for the first live run: `vault` `mem_limit: 128M` is tight for dev mode; each
 Postgres container creates BOTH databases (init script) — harmless, but don't assert one DB
-per container; the Config Server does not serve the working tree — it JGit-**clones** from
-the bind mount at `CONFIG_GIT_DEFAULT_LABEL` (default `main`, verified against the local
-`main` tip), so set `CONFIG_GIT_DEFAULT_LABEL=develop` in `.env` to serve the develop
-branch.
+per container; every Postgres start runs `initdb` + the init script (tmpfs), which costs a
+few seconds; the 128 MiB tmpfs cap also holds WAL and temporary files, so a bulk load can
+fail with `ENOSPC` (demo sizes only) and tmpfs pages count against the 512M `mem_limit`;
+the business services reseed on every start (idempotent); after a non-cascading Postgres
+restart, restart the business services to re-create schema + seed; the Config Server does
+not serve the working tree — it JGit-**clones** from the bind mount at
+`CONFIG_GIT_DEFAULT_LABEL` (default `main`, verified against the local `main` tip), so set
+`CONFIG_GIT_DEFAULT_LABEL=develop` in `.env` to serve the develop branch.
