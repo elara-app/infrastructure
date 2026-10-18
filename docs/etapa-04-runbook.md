@@ -92,11 +92,12 @@ curl -sf http://localhost:8081/actuator/health >/dev/null && echo "8081 health 2
 curl -sf http://localhost:8082/actuator/health >/dev/null && echo "8082 health 200"   # debug binding
 # Startup seed (dev profile): tables + demo rows exist with no manual SQL
 docker compose exec postgres-inventory psql -U postgres -d inventory_db -tAc "SELECT count(*) FROM inventory_item"    # 2
-docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom_status" # 3
 docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom"        # 2
+docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom_status" # 3
 ```
 
-OK: 2× `accepting connections` + 2× `SELECT 1` → `1` + seed counts `2/3/2`; `5672 OPEN`;
+OK: 2× `accepting connections` + 2× `SELECT 1` → `1` + seed counts `2/2/3`
+(inventory item / uom / status); `5672 OPEN`;
 overview 200 with a version; `Sealed: false`; five health 200s. FAIL → R3 per component.
 
 ## E4 — Config Server `:8888/{app}/{profile}`
@@ -204,7 +205,7 @@ path keeps the service segment and 404s; ETAPA-01 ruling + verification).
 
 ## E9 — Acta (one FAIL = FAIL)
 
-Build 5× (E1) + all `healthy` (`compose ps`) + PG 2× `SELECT 1` + seed counts `2/3/2` +
+Build 5× (E1) + all `healthy` (`compose ps`) + PG 2× `SELECT 1` + seed counts `2/2/3` +
 `5672 OPEN` + overview 200 + `Sealed: false` + 2× `kv get` (4 keys each) + config health 200 +
 3× config `200` + Eureka 3 applications UP + health 200 on 8081/8082 (debug bindings) +
 direct/locator/explicit gateway matrix above + seed API rows (2 inventory items referencing
@@ -219,11 +220,14 @@ startup seed (`db/dev/seed.sql`).
 
 - Cascading: `docker compose restart postgres-inventory` (or `postgres-uom`) also restarts
   the dependent service and the gateway (`depends_on: restart: true`) — full recovery.
-- Non-cascading: `docker compose stop` + `start`, `restart --no-deps`, a raw `docker restart`,
-  an OOM kill or a host reboot wipe the tmpfs and leave the services running against a
-  database with no tables. Recover with
+- Postgres-scoped, non-cascading: `restart --no-deps` on a Postgres service, a raw
+  `docker restart` of it, an OOM kill of it, or `docker compose stop postgres-inventory
+  postgres-uom` + `start` for those two, wipe the tmpfs and leave the business services
+  running against a database with no tables. Recover with
   `docker compose restart inventory-service unit-of-measure-service` and re-wait for Eureka.
-- Restarting `vault` empties its in-memory store: re-run the loader one-shot (E6).
+- Host reboot / daemon restart: every container restarts by its `restart: unless-stopped`
+  policy, so the services rebuild schema + seed on their own; only Vault's in-memory store
+  stays empty — re-run the loader one-shot (E6).
 - Restarting only a business service re-runs the seed idempotently against the still-present
   tmpfs database (counts unchanged, no duplicates).
 
@@ -231,7 +235,8 @@ startup seed (`db/dev/seed.sql`).
 
 The tmpfs data directory means a plain `docker compose down` already discards both databases,
 so the reset no longer needs `-v`; the `down -v` variant remains equivalent (the stack declares
-no named volumes to drop, and the profile-gated one-shot survives `down` as an orphan).
+no named volumes to drop, and `down` does not stop the profile-gated one-shot, because
+profiles are not enabled for that command).
 
 ```bash
 docker compose down                     # variant A: enough to discard the tmpfs databases
@@ -255,9 +260,20 @@ curl -fsS -H "Accept: application/json" http://localhost:8761/eureka/apps | jq -
 curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2' >/dev/null && echo "seed inventory OK"
 curl -fsS "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc"            | jq -e '.page.totalElements == 2' >/dev/null && echo "seed uom OK"
 curl -fsS "http://localhost:8080/api/v1/uom/status/?page=0&size=20"                 | jq -e '.page.totalElements == 3' >/dev/null && echo "seed statuses OK"
-# Ephemerality proof: restart the Postgres pair (cascades to the services and gateway) and
-# repeat the three seed checks — the rows return to 2/2/3 even after API inserts.
+# Ephemerality proof: insert a probe row, restart the Postgres pair (cascades to the
+# services and the gateway) and confirm the probe is gone while the seed is back.
+curl -fsS -X POST http://localhost:8080/api/v1/inventory/item/ -H 'Content-Type: application/json' \
+  -d '{"name":"E10 Ephemerality Probe","description":"temporary","baseUnitOfMeasureId":1,"standardCost":1.00,"unitPerPurchaseUom":1.00,"reorderPointQuantity":1.00}' >/dev/null
+curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 3' >/dev/null && echo "probe inserted (3 items)"
 sudo docker compose restart postgres-inventory postgres-uom
+until curl -fsS http://localhost:8080/actuator/health >/dev/null 2>&1; do sleep 5; done
+for i in $(seq 1 24); do
+  if curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2 and ([.content[].name] | index("E10 Ephemerality Probe") == null)' >/dev/null 2>&1; then
+    echo "probe gone, seed back to 2"; break
+  fi
+  if [ "$i" = 24 ]; then echo "FAIL: probe survived the restart"; fi
+  sleep 5
+done
 # NOTE (observed live): right after down/up the loader can fail attaching to the
 # freshly recreated network (`failed to set up container networking: network … not found`,
 # transient daemon race, not a compose bug). Recover with:
