@@ -5,8 +5,9 @@ idempotent Vault secret loader, `compose.yml` for the whole default 9-service st
 environment contract that compose wires into the containers.
 
 See `../docs/ETAPA-02-infra-secretos.md` for the plan and `../docs/ETAPA-03-contenerizacion.md`
-for the containerisation stage that consumes these files (both live in the `docs` repo
-next to this one, not inside it).
+for the containerisation stage that consumes these files. Both are historical stage documents
+kept in the untracked `../docs/` directory of the workspace (the workspace root is not a git
+repository), so they are not versioned with this repo.
 
 ## Layout
 
@@ -33,12 +34,65 @@ env:    POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=inventory_
 ```
 
 Re-runs are safe: an existing database is never recreated, so the log is identical on a
-second pass. Names are comma separated, whitespace tolerant
+second pass. The script now runs on **every** container start, because the Postgres data
+directory is a tmpfs that begins empty (see "Ephemeral data directory" below).
+Names are comma separated, whitespace tolerant
 (`POSTGRES_MULTIPLE_DATABASES="a , b"` creates `a` and `b`), and only plain identifiers
 are accepted — anything else aborts before the SQL is built. If `POSTGRES_DB` is unset the
 official image creates a database named after `POSTGRES_USER` instead, so always set it.
 `compose.yml` mounts the script into `/docker-entrypoint-initdb.d/` of **both** Postgres
 containers, so each of them creates the second database itself.
+
+### Ephemeral data directory
+
+Both Postgres containers keep `/var/lib/postgresql/data` on a 128 MiB tmpfs instead of named
+volumes, on purpose: data does not survive a container stop, restart, `down` or host reboot,
+so every start re-runs `initdb` and the init script. The `size` is a hard cap — WAL and
+temporary files live inside it, so a bulk load can hit `ENOSPC` — and tmpfs pages are RAM
+charged to the container `mem_limit` (they may also be swapped).
+
+The mount applies when the container is **recreated**: use `docker compose up -d` after this
+file changes; `docker compose restart` does not pick up compose-file changes. Machines
+upgrading from the previous persistent layout should drop the old volumes exactly once:
+
+```bash
+sudo docker compose down
+sudo docker volume rm elara_pgdata-inventory elara_pgdata-uom 2>/dev/null || true
+test -z "$(sudo docker volume ls -q --filter name=elara_pgdata)"
+```
+
+### Startup seed (dev)
+
+`inventory-service` and `unit-of-measure-service` run `db/dev/seed.sql` on startup (dev
+profile only). SQL initialization is deferred until after Hibernate creates/updates the
+schema and completes during application startup before the HTTP port opens, so a healthy
+container already carries the demo records:
+
+| rows | contents |
+| --- | --- |
+| `inventory_item` | `Steel Bolt M10` (uom 1), `Aluminum Sheet 4x8` (uom 2) |
+| `uom_status` | `Active`, `Inactive`, `Deprecated` |
+| `uom` | `Kilogram` (factor 1.000), `Gram` (factor 0.001) |
+
+The inserts are idempotent (`ON CONFLICT DO NOTHING` plus identity-sequence resync), so
+restarting only the service never duplicates rows. The inventory `base_unit_of_measure_id`
+values 1 and 2 are a deliberate id contract with the UoM seed.
+
+Restart semantics that go with ephemeral data:
+
+- `docker compose restart postgres-inventory` / `postgres-uom` also restarts the dependent
+  service and the gateway (`depends_on: restart: true`), which re-creates the schema and
+  re-runs the seed.
+- Postgres-scoped operations that bypass that cascade — `restart --no-deps` on a Postgres
+  service, a raw `docker restart` of it, an OOM kill of it, or `docker compose stop
+  postgres-inventory postgres-uom` + `start` for those two — discard the tmpfs and leave
+  the business services running against a database with no tables until you run
+  `docker compose restart inventory-service unit-of-measure-service` (or force-recreate
+  them).
+- Restarting `vault` empties its in-memory store: re-run the profile-gated loader.
+- A host reboot or Docker daemon restart restarts every container by its
+  `restart: unless-stopped` policy, so the services rebuild the schema and re-seed by
+  themselves; only Vault's in-memory store stays empty, so re-run the loader as well.
 
 ## Vault secrets (`scripts/setup-vault.sh`)
 
@@ -132,7 +186,8 @@ docker compose config            # validate the file offline: no daemon needed
 docker compose up -d --build     # build the five images and start everything (needs the daemon)
 docker compose ps                # per-service state and health
 docker compose logs <service> --tail=100
-docker compose down -v           # stop and drop the pgdata-* volumes
+docker compose down              # stop; the tmpfs databases are discarded with the containers
+docker compose down -v           # equivalent here: the stack declares no volumes to drop
 ```
 
 ### `.env` is optional — and now safe to copy
@@ -185,6 +240,11 @@ The Vault secret loader is the one thing `depends_on` cannot do for the business
 services: run the profile-gated one-shot (container or host) once between `vault` and
 the business services (see "Vault bootstrap under compose" above).
 
+The order above is enforced while starting or recreating containers. An explicit
+`docker compose restart <service>` also restarts its dependents (`restart: true`), but
+container-runtime restarts (daemon restart, host reboot, OOM) do not re-evaluate
+`depends_on`; see "Startup seed" for how that interacts with the ephemeral databases.
+
 ### Published ports
 
 | host port | service | note |
@@ -213,15 +273,16 @@ containers reach each other regardless of EXPOSE.
 | `api-gateway` | `build: ../api-gateway` | `8080:8080` | `curl -f http://localhost:8080/actuator/health` (60s) |
 | `inventory-service` | `build: ../inventory-service` | `127.0.0.1:8081:8081` | `curl -f http://localhost:8081/actuator/health` (90s) |
 | `unit-of-measure-service` | `build: ../unit-of-measure-service` | `127.0.0.1:8082:8082` | `curl -f http://localhost:8082/actuator/health` (90s) |
-| `postgres-inventory` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
-| `postgres-uom` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
+| `postgres-inventory` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -h 127.0.0.1 -p 5432 -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
+| `postgres-uom` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -h 127.0.0.1 -p 5432 -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
 | `rabbitmq` | `rabbitmq:3-management-alpine` | `5672:5672`, `15672:15672` | `rabbitmq-diagnostics ping` (40s) |
 | `vault` | `hashicorp/vault:1.16` (dev) | `8200:8200` | `vault status` (20s) |
 
 The five Java images are built from the sibling repos (`build: ../<service>`), so all five
 `Dockerfile`s and `.dockerignore`s from Etapa-03 must exist before `up --build`. Both
-Postgres containers persist to the named volumes `pgdata-inventory` / `pgdata-uom`, and
-both mount `./postgres/init-multiple-dbs.sh` into `/docker-entrypoint-initdb.d/`.
+Postgres containers keep their data on the ephemeral tmpfs described in "Ephemeral data
+directory", and both mount `./postgres/init-multiple-dbs.sh` into
+`/docker-entrypoint-initdb.d/`.
 
 The env names each container reads are the ones documented in `.env.example`
 (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_MULTIPLE_DATABASES`,
@@ -239,13 +300,15 @@ container and the Vault CLI would otherwise default to `https`.
 
 ### Memory and JVM sizing
 
-`mem_limit` is `512M` for `api-gateway`, `inventory-service` and `unit-of-measure-service`,
-`256M` for `config-service`, `discovery-service`, both Postgres containers and `rabbitmq`,
-and `128M` for `vault`. Each of the five Java services gets exactly
+`mem_limit` is `512M` for `api-gateway`, `inventory-service`, `unit-of-measure-service` and
+both Postgres containers (the limit also covers the tmpfs pages charged to the container),
+`256M` for `config-service`, `discovery-service` and `rabbitmq`, and `128M` for `vault`.
+Each of the five Java services gets exactly
 `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75` and no other JVM flag, so the JVM sizes its
 heap from the container limit at startup (75% of `mem_limit`) — tune `mem_limit`, never
 `-Xmx`, and note that the Dockerfiles keep no hardcoded heap of their own. All nine
-services run with `restart: unless-stopped`.
+services run with `restart: unless-stopped`; the profile-gated `vault-loader` is a one-shot
+with `restart: "no"`.
 
 ### Config source (`CONFIG_GIT_URI`)
 

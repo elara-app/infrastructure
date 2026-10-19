@@ -218,18 +218,27 @@ services:
       POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_MULTIPLE_DATABASES:-inventory_db,unit_of_measure_db}
       TZ: ${TZ:-America/Bogota}
     volumes:
-      - pgdata-inventory:/var/lib/postgresql/data
+      # Ephemeral on purpose: tmpfs is destroyed when the container stops, so
+      # every start gets an empty data directory and the init scripts run
+      # again; the service seeds its database on startup (dev profile).
+      - type: tmpfs
+        target: /var/lib/postgresql/data
+        tmpfs:
+          size: 134217728  # 128 MiB cap; tmpfs pages count against mem_limit
       # `$$` keeps compose from interpolating POSTGRES_USER/POSTGRES_DB, so the
       # container's own entrypoint values are what pg_isready checks.
       - ./postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # TCP, not the default socket: while initdb and the init scripts run, the
+      # image serves a temporary socket-only instance, so a socket probe could
+      # report ready before initialization finishes.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 30s
     restart: unless-stopped
-    mem_limit: 256M
+    mem_limit: 512M  # tmpfs data is RAM and is charged to this limit
     networks:
       - elara-net
 
@@ -244,16 +253,25 @@ services:
       POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_MULTIPLE_DATABASES:-inventory_db,unit_of_measure_db}
       TZ: ${TZ:-America/Bogota}
     volumes:
-      - pgdata-uom:/var/lib/postgresql/data
+      # Ephemeral on purpose: tmpfs is destroyed when the container stops, so
+      # every start gets an empty data directory and the init scripts run
+      # again; the service seeds its database on startup (dev profile).
+      - type: tmpfs
+        target: /var/lib/postgresql/data
+        tmpfs:
+          size: 134217728  # 128 MiB cap; tmpfs pages count against mem_limit
       - ./postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      # TCP, not the default socket: while initdb and the init scripts run, the
+      # image serves a temporary socket-only instance, so a socket probe could
+      # report ready before initialization finishes.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 30s
     restart: unless-stopped
-    mem_limit: 256M
+    mem_limit: 512M  # tmpfs data is RAM and is charged to this limit
     networks:
       - elara-net
 
@@ -326,10 +344,6 @@ services:
     networks:
       - elara-net
     restart: "no"
-
-volumes:
-  pgdata-inventory: {}
-  pgdata-uom: {}
 
 networks:
   elara-net:
