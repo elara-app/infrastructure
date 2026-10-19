@@ -1,0 +1,20 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: develop
+
+  - package-ecosystem: docker
+    directory: /vault-loader
+    schedule:
+      interval: weekly
+    target-branch: develop
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: develop
