@@ -19,6 +19,20 @@ jobs:
         run: docker compose -f compose.yml config --quiet
       - name: Render published compose
         run: docker compose -f compose.published.yml config --format json > /tmp/published.json
+      - name: Render published compose with host token drift
+        run: VAULT_TOKEN=drifted SPRING_CLOUD_VAULT_TOKEN=drifted docker compose -f compose.published.yml config --format json > /tmp/published-drift.json
+      - name: Render published compose with port overrides
+        run: |
+          ELARA_BIND=127.0.0.2 \
+          ELARA_PORT_CONFIG=18888 \
+          ELARA_PORT_DISCOVERY=18761 \
+          ELARA_PORT_GATEWAY=18080 \
+          ELARA_PORT_INVENTORY=18081 \
+          ELARA_PORT_UOM=18082 \
+          ELARA_PORT_RABBITMQ=15673 \
+          ELARA_PORT_RABBITMQ_MGMT=15674 \
+          ELARA_PORT_VAULT=18200 \
+          docker compose -f compose.published.yml config --format json > /tmp/published-overrides.json
       - name: Assert published compose contract
         shell: bash
         run: |
@@ -94,7 +108,9 @@ jobs:
                 | $root.services[$name].healthcheck.test[0] == "CMD-SHELL"
                   and ($root.services[$name].healthcheck.test[1] | contains("pg_isready -h 127.0.0.1 -p 5432"))
                   and ($root.services[$name].healthcheck.test[1] | contains("$${POSTGRES_USER}"))
-                  and ($root.services[$name].healthcheck.test[1] | contains("$${POSTGRES_DB}")))'
+                  and ($root.services[$name].healthcheck.test[1] | contains("$${POSTGRES_DB}"))
+                  and $root.services[$name].healthcheck.test != ["NONE"]
+                  and $root.services[$name].healthcheck.disable != true)'
 
           check "both Postgres services cap memory at 512 MiB" '
             [.services["postgres-inventory"].mem_limit,
@@ -126,7 +142,9 @@ jobs:
                "inventory-service", "unit-of-measure-service",
                "postgres-inventory", "postgres-uom", "rabbitmq", "vault"]
             | all(. as $name
-                | ($root.services[$name].healthcheck.test | length) > 0)'
+                | ($root.services[$name].healthcheck.test | length) > 0
+                  and $root.services[$name].healthcheck.test != ["NONE"]
+                  and $root.services[$name].healthcheck.disable != true)'
 
           # shellcheck disable=SC2016
           check "vault runs a dev server with the root token default" '
@@ -136,7 +154,9 @@ jobs:
                 "-dev",
                 "-dev-root-token-id=00000000-0000-0000-0000-000000000000"
               ]
-              and $vault.healthcheck.test == ["CMD", "vault", "status"]'
+              and $vault.healthcheck.test == ["CMD", "vault", "status"]
+              and $vault.healthcheck.test != ["NONE"]
+              and $vault.healthcheck.disable != true'
 
           # shellcheck disable=SC2016
           check "vault-loader is a one-shot shell block that waits for healthy vault" '
@@ -148,6 +168,12 @@ jobs:
               and $loader.depends_on.vault.condition == "service_healthy"
               and ($loader | has("healthcheck") | not)
               and ($loader | has("profiles") | not)'
+
+          # shellcheck disable=SC2016
+          check "vault-loader and vault use the dev root token" '
+            .services["vault-loader"].environment.VAULT_ADDR == "http://vault:8200"
+            and .services["vault-loader"].environment.VAULT_TOKEN == "00000000-0000-0000-0000-000000000000"
+            and .services.vault.environment.VAULT_DEV_ROOT_TOKEN_ID == "00000000-0000-0000-0000-000000000000"'
 
           # shellcheck disable=SC2016
           check "vault-loader seeds and verifies both service secret paths" '
@@ -186,7 +212,10 @@ jobs:
             | ["inventory-service", "unit-of-measure-service"]
             | all(. as $name
                 | $root.services[$name].environment as $env
-                | ($env.SPRING_DATASOURCE_URL | startswith("jdbc:postgresql://postgres-"))
+                | (if $name == "inventory-service"
+                   then $env.SPRING_DATASOURCE_URL == "jdbc:postgresql://postgres-inventory:5432/inventory_db"
+                   else $env.SPRING_DATASOURCE_URL == "jdbc:postgresql://postgres-uom:5432/unit_of_measure_db"
+                   end)
                   and $env.SPRING_DATASOURCE_USERNAME == "postgres"
                   and $env.SPRING_DATASOURCE_PASSWORD == "postgres"
                   and $env.SPRING_RABBITMQ_HOST == "rabbitmq"
@@ -198,6 +227,25 @@ jobs:
                   and $env.VAULT_URI == "http://vault:8200"
                   and $env.VAULT_TOKEN == "00000000-0000-0000-0000-000000000000"
                   and $env.SPRING_CLOUD_VAULT_TOKEN == "00000000-0000-0000-0000-000000000000")'
+
+          # shellcheck disable=SC2016
+          check "api-gateway targets config and discovery siblings" '
+            .services["api-gateway"].environment as $env
+            | $env.CONFIG_URI == "http://config-service:8888"
+              and $env.EUREKA_URI == "http://discovery-service:8761/eureka/"'
+
+          # shellcheck disable=SC2016
+          check "service database URLs target the exact sibling databases" '
+            .services["inventory-service"].environment.SPRING_DATASOURCE_URL == "jdbc:postgresql://postgres-inventory:5432/inventory_db"
+            and .services["unit-of-measure-service"].environment.SPRING_DATASOURCE_URL == "jdbc:postgresql://postgres-uom:5432/unit_of_measure_db"'
+
+          # shellcheck disable=SC2016
+          check "all five Java services set the JVM heap percentage" '
+            . as $root
+            | ["config-service", "discovery-service", "api-gateway",
+               "inventory-service", "unit-of-measure-service"]
+            | all(. as $name
+                | $root.services[$name].environment.JAVA_TOOL_OPTIONS == "-XX:MaxRAMPercentage=75")'
 
           # shellcheck disable=SC2016
           check "config-service clones main on start without a git URI override" '
@@ -222,21 +270,57 @@ jobs:
             and .services["vault"].image == "hashicorp/vault:1.16.3"
             and .services["vault-loader"].image == "hashicorp/vault:1.16.3"'
 
+          # A second render proves the token pins ignore host-level drift.
+          published=/tmp/published-drift.json
+          # shellcheck disable=SC2016
+          check "host VAULT_TOKEN drift cannot reach the loader or Java services" '
+            .services["vault-loader"].environment.VAULT_TOKEN == "00000000-0000-0000-0000-000000000000"
+            and .services.vault.environment.VAULT_DEV_ROOT_TOKEN_ID == "00000000-0000-0000-0000-000000000000"
+            and ([.services["inventory-service"], .services["unit-of-measure-service"]]
+                 | all(.environment.VAULT_TOKEN == "00000000-0000-0000-0000-000000000000"
+                       and .environment.SPRING_CLOUD_VAULT_TOKEN == "00000000-0000-0000-0000-000000000000"))'
+
+          # A third render proves every per-port override reaches its target.
+          published=/tmp/published-overrides.json
+          check "per-port overrides remap all eight loopback mappings" '
+            ([.services[] | (.ports // [])[]
+              | "\(.host_ip):\(.published):\(.target)"] | sort) == [
+              "127.0.0.2:15673:5672",
+              "127.0.0.2:15674:15672",
+              "127.0.0.2:18080:8080",
+              "127.0.0.2:18081:8081",
+              "127.0.0.2:18082:8082",
+              "127.0.0.2:18200:8200",
+              "127.0.0.2:18761:8761",
+              "127.0.0.2:18888:8888"
+            ]'
+          published=/tmp/published.json
+          rm -f /tmp/published-drift.json /tmp/published-overrides.json
+
           # The loopback bind and per-port knobs are interpolation-only, so guard
-          # them at the source level in addition to the rendered JSON above.
-          for variable in \
-            ELARA_PORT_CONFIG ELARA_PORT_DISCOVERY ELARA_PORT_GATEWAY \
-            ELARA_PORT_INVENTORY ELARA_PORT_UOM ELARA_PORT_RABBITMQ \
-            ELARA_PORT_RABBITMQ_MGMT ELARA_PORT_VAULT; do
-            if ! grep -q "\${${variable}:-" compose.published.yml; then
-              echo "::error::published compose is missing per-port override ${variable}" >&2
+          # the exact source lines in addition to the rendered JSON above.
+          # shellcheck disable=SC2016
+          port_lines=(
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_CONFIG:-8888}:8888'
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_DISCOVERY:-8761}:8761'
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_GATEWAY:-8080}:8080'
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_INVENTORY:-8081}:8081'
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_UOM:-8082}:8082'
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ:-5672}:5672'
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ_MGMT:-15672}:15672'
+            '${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_VAULT:-8200}:8200'
+          )
+          for mapping in "${port_lines[@]}"; do
+            if ! grep -Fqx "      - \"${mapping}\"" compose.published.yml; then
+              echo "::error::published compose is missing exact port line: - \"${mapping}\"" >&2
               exit 1
             fi
           done
 
           # shellcheck disable=SC2016
-          if ! grep -q '\${ELARA_BIND:-127.0.0.1}' compose.published.yml; then
-            echo "::error::published compose is missing the loopback ELARA_BIND default" >&2
+          bind_count=$(grep -Fo '${ELARA_BIND:-127.0.0.1}' compose.published.yml | wc -l || true)
+          if [ "${bind_count}" -ne 8 ]; then
+            echo "::error::published compose must use the loopback ELARA_BIND default exactly eight times (found ${bind_count})" >&2
             exit 1
           fi
 

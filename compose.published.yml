@@ -77,8 +77,8 @@ services:
     environment:
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
       SERVER_PORT: "8080"
-      CONFIG_URI: ${CONFIG_URI:-http://config-service:8888}
-      EUREKA_URI: ${EUREKA_URI:-http://discovery-service:8761/eureka/}
+      CONFIG_URI: http://config-service:8888
+      EUREKA_URI: http://discovery-service:8761/eureka/
     depends_on:
       config-service:
         condition: service_healthy
@@ -113,18 +113,18 @@ services:
     environment:
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
       SERVER_PORT: "8081"
-      CONFIG_URI: ${CONFIG_URI:-http://config-service:8888}
-      EUREKA_URI: ${EUREKA_URI:-http://discovery-service:8761/eureka/}
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:postgresql://postgres-inventory:5432/inventory_db}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-postgres}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-postgres}
-      SPRING_RABBITMQ_HOST: ${SPRING_RABBITMQ_HOST:-rabbitmq}
-      SPRING_RABBITMQ_PORT: ${SPRING_RABBITMQ_PORT:-5672}
-      SPRING_RABBITMQ_USERNAME: ${SPRING_RABBITMQ_USERNAME:-elara}
-      SPRING_RABBITMQ_PASSWORD: ${SPRING_RABBITMQ_PASSWORD:-elara}
-      VAULT_URI: ${VAULT_URI:-http://vault:8200}
-      VAULT_TOKEN: ${VAULT_TOKEN:-${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}}
-      SPRING_CLOUD_VAULT_TOKEN: ${SPRING_CLOUD_VAULT_TOKEN:-${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}}
+      CONFIG_URI: http://config-service:8888
+      EUREKA_URI: http://discovery-service:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-inventory:5432/inventory_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: "5672"
+      SPRING_RABBITMQ_USERNAME: elara
+      SPRING_RABBITMQ_PASSWORD: elara
+      VAULT_URI: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+      SPRING_CLOUD_VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
     depends_on:
       config-service:
         condition: service_healthy
@@ -163,18 +163,18 @@ services:
     environment:
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
       SERVER_PORT: "8082"
-      CONFIG_URI: ${CONFIG_URI:-http://config-service:8888}
-      EUREKA_URI: ${EUREKA_URI:-http://discovery-service:8761/eureka/}
-      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:-jdbc:postgresql://postgres-uom:5432/unit_of_measure_db}
-      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-postgres}
-      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-postgres}
-      SPRING_RABBITMQ_HOST: ${SPRING_RABBITMQ_HOST:-rabbitmq}
-      SPRING_RABBITMQ_PORT: ${SPRING_RABBITMQ_PORT:-5672}
-      SPRING_RABBITMQ_USERNAME: ${SPRING_RABBITMQ_USERNAME:-elara}
-      SPRING_RABBITMQ_PASSWORD: ${SPRING_RABBITMQ_PASSWORD:-elara}
-      VAULT_URI: ${VAULT_URI:-http://vault:8200}
-      VAULT_TOKEN: ${VAULT_TOKEN:-${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}}
-      SPRING_CLOUD_VAULT_TOKEN: ${SPRING_CLOUD_VAULT_TOKEN:-${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}}
+      CONFIG_URI: http://config-service:8888
+      EUREKA_URI: http://discovery-service:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-uom:5432/unit_of_measure_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: "5672"
+      SPRING_RABBITMQ_USERNAME: elara
+      SPRING_RABBITMQ_PASSWORD: elara
+      VAULT_URI: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+      SPRING_CLOUD_VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
     depends_on:
       config-service:
         condition: service_healthy
@@ -211,8 +211,8 @@ services:
     expose:
       - "5432"
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_DB: inventory_db
     volumes:
       - type: tmpfs
@@ -240,8 +240,8 @@ services:
     expose:
       - "5432"
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_DB: unit_of_measure_db
     volumes:
       - type: tmpfs
@@ -273,8 +273,8 @@ services:
       - "5672"
       - "15672"
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-elara}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-elara}
+      RABBITMQ_DEFAULT_USER: elara
+      RABBITMQ_DEFAULT_PASS: elara
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
