@@ -187,6 +187,23 @@ jobs:
               and ($parts[4] | startswith("get secret/unit-of-measure-service/dev "))'
 
           # shellcheck disable=SC2016
+          check "demo credential literals match the vault-loader seed values" '
+            . as $root
+            | (["postgres-inventory", "postgres-uom"]
+               | all(. as $name
+                   | $root.services[$name].environment.POSTGRES_USER == "postgres"
+                     and $root.services[$name].environment.POSTGRES_PASSWORD == "postgres"))
+              and $root.services["rabbitmq"].environment.RABBITMQ_DEFAULT_USER == "elara"
+              and $root.services["rabbitmq"].environment.RABBITMQ_DEFAULT_PASS == "elara"
+              and (["inventory-service", "unit-of-measure-service"]
+                   | all(. as $name
+                       | $root.services[$name].environment
+                       | .SPRING_DATASOURCE_USERNAME == "postgres"
+                         and .SPRING_DATASOURCE_PASSWORD == "postgres"
+                         and .SPRING_RABBITMQ_USERNAME == "elara"
+                         and .SPRING_RABBITMQ_PASSWORD == "elara"))'
+
+          # shellcheck disable=SC2016
           check "inventory-service waits for dependencies including loader completion" '
             .services["inventory-service"].depends_on as $deps
             | $deps["config-service"].condition == "service_healthy"
@@ -321,6 +338,15 @@ jobs:
           bind_count=$(grep -Fo '${ELARA_BIND:-127.0.0.1}' compose.published.yml | wc -l || true)
           if [ "${bind_count}" -ne 8 ]; then
             echo "::error::published compose must use the loopback ELARA_BIND default exactly eight times (found ${bind_count})" >&2
+            exit 1
+          fi
+
+          # Host Vault token variables must never be interpolated; the published
+          # stack always pins the dev root token through VAULT_DEV_ROOT_TOKEN_ID.
+          # shellcheck disable=SC2016
+          if grep -Fq '${VAULT_TOKEN:' compose.published.yml \
+             || grep -Fq '${SPRING_CLOUD_VAULT_TOKEN:' compose.published.yml; then
+            echo "::error::compose.published.yml must not interpolate host VAULT_TOKEN or SPRING_CLOUD_VAULT_TOKEN" >&2
             exit 1
           fi
 
