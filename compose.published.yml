@@ -340,7 +340,7 @@ services:
         vault kv get secret/unit-of-measure-service/dev >/dev/null
     environment:
       VAULT_ADDR: http://vault:8200
-      VAULT_TOKEN: ${VAULT_TOKEN:-${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}}
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
     depends_on:
       vault:
         condition: service_healthy

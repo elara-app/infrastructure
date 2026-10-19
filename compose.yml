@@ -335,7 +335,7 @@ services:
         condition: service_healthy
     environment:
       VAULT_ADDR: http://vault:8200
-      VAULT_TOKEN: ${VAULT_TOKEN:-${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}}
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
       SECRETS_DIR: /secrets
       PROFILES: ${VAULT_LOAD_PROFILES:-dev}
     volumes:
