@@ -17,3 +17,227 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate and render compose.yml
         run: docker compose -f compose.yml config --quiet
+      - name: Render published compose
+        run: docker compose -f compose.published.yml config --format json > /tmp/published.json
+      - name: Assert published compose contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          published=/tmp/published.json
+          checked=0
+
+          check() {
+            local label="$1"
+            local filter="$2"
+            if ! jq -e "$filter" "$published" >/dev/null; then
+              echo "::error::published compose assertion failed: $label" >&2
+              exit 1
+            fi
+            checked=$((checked + 1))
+          }
+
+          check "exactly ten expected services" '
+            (.services | keys | sort) == [
+              "api-gateway",
+              "config-service",
+              "discovery-service",
+              "inventory-service",
+              "postgres-inventory",
+              "postgres-uom",
+              "rabbitmq",
+              "unit-of-measure-service",
+              "vault",
+              "vault-loader"
+            ]'
+
+          check "project name and single bridge network" '
+            .name == "elara-demo"
+            and (.networks | keys) == ["elara-net"]
+            and .networks["elara-net"].driver == "bridge"'
+
+          check "no top-level volumes, configs, or secrets" '
+            ([.volumes, .configs, .secrets] | map(. // {} | length) | add) == 0'
+
+          check "no service builds" '
+            .services | all(has("build") | not)'
+
+          check "all mounts are tmpfs" '
+            [.services[] | (.volumes // [])[] | select(.type != "tmpfs")] | length == 0'
+
+          check "no env_file references" '
+            [.services[] | select(has("env_file"))] | length == 0'
+
+          check "no service configs or secrets" '
+            [.services[] | select(has("configs") or has("secrets"))] | length == 0'
+
+          check "both Postgres services use one database each" '
+            .services["postgres-inventory"].environment.POSTGRES_DB == "inventory_db"
+            and .services["postgres-uom"].environment.POSTGRES_DB == "unit_of_measure_db"
+            and ([.services["postgres-inventory"], .services["postgres-uom"]]
+                 | all(.environment | has("POSTGRES_MULTIPLE_DATABASES") | not))'
+
+          # shellcheck disable=SC2016
+          check "both Postgres services use a 128 MiB tmpfs PGDATA" '
+            . as $root
+            | ["postgres-inventory", "postgres-uom"]
+            | all(. as $name
+                | ($root.services[$name].volumes | length == 1)
+                  and $root.services[$name].volumes[0].type == "tmpfs"
+                  and $root.services[$name].volumes[0].target == "/var/lib/postgresql/data"
+                  and $root.services[$name].volumes[0].tmpfs.size == "134217728")'
+
+          # shellcheck disable=SC2016
+          check "both Postgres healthchecks probe TCP with container credentials" '
+            . as $root
+            | ["postgres-inventory", "postgres-uom"]
+            | all(. as $name
+                | $root.services[$name].healthcheck.test[0] == "CMD-SHELL"
+                  and ($root.services[$name].healthcheck.test[1] | contains("pg_isready -h 127.0.0.1 -p 5432"))
+                  and ($root.services[$name].healthcheck.test[1] | contains("$${POSTGRES_USER}"))
+                  and ($root.services[$name].healthcheck.test[1] | contains("$${POSTGRES_DB}")))'
+
+          check "both Postgres services cap memory at 512 MiB" '
+            [.services["postgres-inventory"].mem_limit,
+             .services["postgres-uom"].mem_limit] == ["536870912", "536870912"]'
+
+          check "published ports are the eight expected loopback mappings" '
+            ([.services[] | (.ports // [])[]
+              | "\(.host_ip):\(.published):\(.target)"] | sort) == [
+              "127.0.0.1:15672:15672",
+              "127.0.0.1:5672:5672",
+              "127.0.0.1:8080:8080",
+              "127.0.0.1:8081:8081",
+              "127.0.0.1:8082:8082",
+              "127.0.0.1:8200:8200",
+              "127.0.0.1:8761:8761",
+              "127.0.0.1:8888:8888"
+            ]'
+
+          check "every service uses bounded json-file logging" '
+            .services | to_entries | all(
+              .value.logging.driver == "json-file"
+              and .value.logging.options["max-size"] == "10m"
+              and .value.logging.options["max-file"] == "3")'
+
+          # shellcheck disable=SC2016
+          check "all nine long-running services have healthchecks" '
+            . as $root
+            | ["config-service", "discovery-service", "api-gateway",
+               "inventory-service", "unit-of-measure-service",
+               "postgres-inventory", "postgres-uom", "rabbitmq", "vault"]
+            | all(. as $name
+                | ($root.services[$name].healthcheck.test | length) > 0)'
+
+          # shellcheck disable=SC2016
+          check "vault runs a dev server with the root token default" '
+            .services["vault"] as $vault
+            | $vault.command == [
+                "server",
+                "-dev",
+                "-dev-root-token-id=00000000-0000-0000-0000-000000000000"
+              ]
+              and $vault.healthcheck.test == ["CMD", "vault", "status"]'
+
+          # shellcheck disable=SC2016
+          check "vault-loader is a one-shot shell block that waits for healthy vault" '
+            .services["vault-loader"] as $loader
+            | $loader.image == "hashicorp/vault:1.16.3"
+              and $loader.entrypoint == ["/bin/sh", "-c"]
+              and ($loader.command | length) == 1
+              and $loader.restart == "no"
+              and $loader.depends_on.vault.condition == "service_healthy"
+              and ($loader | has("healthcheck") | not)
+              and ($loader | has("profiles") | not)'
+
+          # shellcheck disable=SC2016
+          check "vault-loader seeds and verifies both service secret paths" '
+            .services["vault-loader"].command[0] as $command
+            | ($command | gsub("\\\\\\n\\s*"; " ") | gsub("\\s+"; " ")) as $flat
+            | ($flat | split("vault kv ")) as $parts
+            | ($parts | length) == 5
+              and $parts[1] == "put secret/inventory-service/dev spring.datasource.username=postgres spring.datasource.password=postgres spring.rabbitmq.username=elara spring.rabbitmq.password=elara "
+              and $parts[2] == "put secret/unit-of-measure-service/dev spring.datasource.username=postgres spring.datasource.password=postgres spring.rabbitmq.username=elara spring.rabbitmq.password=elara "
+              and ($parts[3] | startswith("get secret/inventory-service/dev "))
+              and ($parts[4] | startswith("get secret/unit-of-measure-service/dev "))'
+
+          # shellcheck disable=SC2016
+          check "inventory-service waits for dependencies including loader completion" '
+            .services["inventory-service"].depends_on as $deps
+            | $deps["config-service"].condition == "service_healthy"
+              and $deps["discovery-service"].condition == "service_healthy"
+              and $deps["postgres-inventory"].condition == "service_healthy"
+              and $deps["rabbitmq"].condition == "service_healthy"
+              and $deps["vault"].condition == "service_healthy"
+              and $deps["vault-loader"].condition == "service_completed_successfully"'
+
+          # shellcheck disable=SC2016
+          check "unit-of-measure-service waits for dependencies including loader completion" '
+            .services["unit-of-measure-service"].depends_on as $deps
+            | $deps["config-service"].condition == "service_healthy"
+              and $deps["discovery-service"].condition == "service_healthy"
+              and $deps["postgres-uom"].condition == "service_healthy"
+              and $deps["rabbitmq"].condition == "service_healthy"
+              and $deps["vault"].condition == "service_healthy"
+              and $deps["vault-loader"].condition == "service_completed_successfully"'
+
+          # shellcheck disable=SC2016
+          check "service environments target compose siblings" '
+            . as $root
+            | ["inventory-service", "unit-of-measure-service"]
+            | all(. as $name
+                | $root.services[$name].environment as $env
+                | ($env.SPRING_DATASOURCE_URL | startswith("jdbc:postgresql://postgres-"))
+                  and $env.SPRING_DATASOURCE_USERNAME == "postgres"
+                  and $env.SPRING_DATASOURCE_PASSWORD == "postgres"
+                  and $env.SPRING_RABBITMQ_HOST == "rabbitmq"
+                  and $env.SPRING_RABBITMQ_PORT == "5672"
+                  and $env.SPRING_RABBITMQ_USERNAME == "elara"
+                  and $env.SPRING_RABBITMQ_PASSWORD == "elara"
+                  and $env.CONFIG_URI == "http://config-service:8888"
+                  and $env.EUREKA_URI == "http://discovery-service:8761/eureka/"
+                  and $env.VAULT_URI == "http://vault:8200"
+                  and $env.VAULT_TOKEN == "00000000-0000-0000-0000-000000000000"
+                  and $env.SPRING_CLOUD_VAULT_TOKEN == "00000000-0000-0000-0000-000000000000")'
+
+          # shellcheck disable=SC2016
+          check "config-service clones main on start without a git URI override" '
+            .services["config-service"].environment as $env
+            | $env.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL == "main"
+              and $env.SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START == "true"
+              and ($env | has("CONFIG_GIT_URI") | not)'
+
+          check "five Elara images are pull-only latest tags" '
+            ([.services[].image | select(startswith("ghcr.io/elara-app/"))] | sort) == [
+              "ghcr.io/elara-app/api-gateway:latest",
+              "ghcr.io/elara-app/config-service:latest",
+              "ghcr.io/elara-app/discovery-service:latest",
+              "ghcr.io/elara-app/inventory-service:latest",
+              "ghcr.io/elara-app/unit-of-measure-service:latest"
+            ]'
+
+          check "infrastructure images are the expected pinned tags" '
+            [.services["postgres-inventory"].image,
+             .services["postgres-uom"].image] == ["postgres:16-alpine", "postgres:16-alpine"]
+            and .services["rabbitmq"].image == "rabbitmq:3-management-alpine"
+            and .services["vault"].image == "hashicorp/vault:1.16.3"
+            and .services["vault-loader"].image == "hashicorp/vault:1.16.3"'
+
+          # The loopback bind and per-port knobs are interpolation-only, so guard
+          # them at the source level in addition to the rendered JSON above.
+          for variable in \
+            ELARA_PORT_CONFIG ELARA_PORT_DISCOVERY ELARA_PORT_GATEWAY \
+            ELARA_PORT_INVENTORY ELARA_PORT_UOM ELARA_PORT_RABBITMQ \
+            ELARA_PORT_RABBITMQ_MGMT ELARA_PORT_VAULT; do
+            if ! grep -q "\${${variable}:-" compose.published.yml; then
+              echo "::error::published compose is missing per-port override ${variable}" >&2
+              exit 1
+            fi
+          done
+
+          # shellcheck disable=SC2016
+          if ! grep -q '\${ELARA_BIND:-127.0.0.1}' compose.published.yml; then
+            echo "::error::published compose is missing the loopback ELARA_BIND default" >&2
+            exit 1
+          fi
+
+          echo "published compose: ${checked} assertions passed"
