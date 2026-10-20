@@ -1,0 +1,26 @@
+# Demo-only local log viewer overlay. This file is never part of the published
+# OCI artifact: Dozzle needs the Docker socket, so it stays an explicit overlay
+# on top of compose.published.yml instead of shipping with the consumer stack.
+#
+#   docker compose -f compose.published.yml -f compose.logs.yml up -d
+
+services:
+  dozzle:
+    image: amir20/dozzle:v11.3.3
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_DOZZLE:-9999}:8080"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    environment:
+      DOZZLE_ENABLE_ACTIONS: "false"
+      DOZZLE_ENABLE_SHELL: "false"
+      DOZZLE_NO_ANALYTICS: "true"
+    healthcheck:
+      test: ["CMD", "/dozzle", "healthcheck"]
+      interval: 5s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - elara-net
