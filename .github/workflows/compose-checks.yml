@@ -282,8 +282,8 @@ jobs:
 
           check "infrastructure images are the expected pinned tags" '
             [.services["postgres-inventory"].image,
-             .services["postgres-uom"].image] == ["postgres:16-alpine", "postgres:16-alpine"]
-            and .services["rabbitmq"].image == "rabbitmq:3-management-alpine"
+             .services["postgres-uom"].image] == ["postgres:16.15-alpine", "postgres:16.15-alpine"]
+            and .services["rabbitmq"].image == "rabbitmq:3.13.7-management-alpine"
             and .services["vault"].image == "hashicorp/vault:1.16.3"
             and .services["vault-loader"].image == "hashicorp/vault:1.16.3"'
 
