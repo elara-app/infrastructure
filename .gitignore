@@ -1,7 +1,6 @@
 # Environment files (real secrets never committed)
 .env
 .env.*
-!.env.example
 *.log
 
 # Local scratch
