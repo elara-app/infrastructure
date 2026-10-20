@@ -138,6 +138,8 @@ jobs:
             '[.services[] | select(has("configs") or has("secrets"))] | length == 0'
           assert 'expected every mount to be tmpfs' \
             '[.services[] | (.volumes // [])[] | select(.type != "tmpfs")] | length == 0'
+          assert 'expected the vault container to cap memory at 512 MiB' \
+            '.services.vault.mem_limit == "536870912"'
 
       - name: Verify configuration pins container endpoints
         shell: bash
