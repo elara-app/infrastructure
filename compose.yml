@@ -208,7 +208,7 @@ services:
   # --- Infrastructure services ------------------------------------------------
 
   postgres-inventory:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     expose:
       - "5432"
     environment:
@@ -243,7 +243,7 @@ services:
       - elara-net
 
   postgres-uom:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     expose:
       - "5432"
     environment:
@@ -276,7 +276,7 @@ services:
       - elara-net
 
   rabbitmq:
-    image: rabbitmq:3-management-alpine
+    image: rabbitmq:3.13.7-management-alpine
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -298,7 +298,7 @@ services:
       - elara-net
 
   vault:
-    image: hashicorp/vault:1.16
+    image: hashicorp/vault:1.16.3
     ports:
       - "8200:8200"
     expose:
@@ -325,7 +325,7 @@ services:
       - elara-net
 
   # One-shot Vault bootstrap (profile-gated: hidden from the default 9-service
-  # stack; default `config`/`up` still render exactly 9). CLI 1.16 == server 1.16.
+  # stack; default `config`/`up` still render exactly 9). CLI 1.16.3 == server 1.16.3.
   # Run: sudo docker compose --profile bootstrap up vault-loader
   vault-loader:
     build: ./vault-loader

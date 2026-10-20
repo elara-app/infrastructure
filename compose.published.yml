@@ -207,7 +207,7 @@ services:
   # --- Infrastructure services ----------------------------------------------
 
   postgres-inventory:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     expose:
       - "5432"
     environment:
@@ -236,7 +236,7 @@ services:
       - elara-net
 
   postgres-uom:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     expose:
       - "5432"
     environment:
@@ -265,7 +265,7 @@ services:
       - elara-net
 
   rabbitmq:
-    image: rabbitmq:3-management-alpine
+    image: rabbitmq:3.13.7-management-alpine
     ports:
       - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ:-5672}:5672"
       - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ_MGMT:-15672}:15672"
