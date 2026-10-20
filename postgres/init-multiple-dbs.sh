@@ -7,7 +7,7 @@
 # Edge case: if POSTGRES_DB is unset the official image creates a database named
 # after POSTGRES_USER instead, so the default 'inventory_db' below would not
 # exist and every psql call below would fail on a missing database. POSTGRES_DB
-# must therefore always be set (the .env.example contract sets it, and Etapa-03
+# must therefore always be set (the compose contract sets it, and Etapa-03
 # passes it to both Postgres containers).
 set -euo pipefail
 

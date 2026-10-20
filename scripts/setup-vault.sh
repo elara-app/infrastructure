@@ -69,7 +69,7 @@ require_bin vault
 require_bin jq
 require_bin base64
 
-[ -n "${VAULT_TOKEN:-}" ] || die "VAULT_TOKEN is empty or unset; export it (compose maps it from VAULT_DEV_ROOT_TOKEN_ID, see .env.example)"
+[ -n "${VAULT_TOKEN:-}" ] || die "VAULT_TOKEN is empty or unset; export it explicitly or use the compose default (compose maps it from VAULT_DEV_ROOT_TOKEN_ID)"
 
 case "${WAIT_TIMEOUT}" in
   ''|*[!0-9]*) die "WAIT_TIMEOUT must be a non-negative integer of seconds, got '${WAIT_TIMEOUT}'" ;;

@@ -17,7 +17,6 @@ repository), so they are not versioned with this repo.
 | `scripts/setup-vault.sh` | Loads `service-secrets/*.json` into Vault (KV v2), idempotently. |
 | `vault-loader/Dockerfile` | One-shot Vault bootstrap image (vault 1.16 CLI + bash/jq/base64). |
 | `compose.yml` | The default 9-service stack on `elara-net` (5 Java builds + infra images). |
-| `.env.example` | The full environment contract. Compose-safe defaults: copying it verbatim keeps compose's container DNS.
 
 ## Postgres bootstrap (`postgres/init-multiple-dbs.sh`)
 
@@ -103,7 +102,6 @@ e.g. `secret/unit-of-measure-service/dev` — never a short prefix such as `uom`
 writes each entry as a separate `key=value` argument.
 
 ```bash
-cp .env.example .env
 export VAULT_ADDR=http://127.0.0.1:8200
 export VAULT_TOKEN=00000000-0000-0000-0000-000000000000   # or $VAULT_DEV_ROOT_TOKEN_ID
 SECRETS_DIR=../centralized-configuration/service-secrets \
@@ -134,11 +132,11 @@ but stays hidden from the default `config`/`up` render (default render is still 
 9 services). Run it as a container one-shot against the `vault` service:
 
 ```bash
-docker compose up -d vault        # dev mode: unsealed, root token from .env or the compose default
+docker compose up -d vault        # dev mode: unsealed, root token from the compose default or an explicit environment override
 sudo docker compose --profile bootstrap up vault-loader   # waits for `vault` healthy via depends_on, loads `dev` by default
 ```
 
-Profile selection: `VAULT_LOAD_PROFILES=test` in `.env` or `--profiles dev,test` appended
+Profile selection: `VAULT_LOAD_PROFILES=test` in the environment or `--profiles dev,test` appended
 to the run command changes what gets loaded. Host one-shot kept as alternative:
 
 ```bash
@@ -179,7 +177,7 @@ Vault only.
 
 `compose.yml` starts all nine services of the default stack on the `elara-net` bridge network. Every
 interpolated value is written `${VAR:-<container DNS default>}`, so the stack is correct
-with **no `.env` at all** — the defaults already are the compose service names.
+with **no environment file** — the defaults already are the compose service names.
 
 ```bash
 docker compose config            # validate the file offline: no daemon needed
@@ -190,32 +188,21 @@ docker compose down              # stop; the tmpfs databases are discarded with 
 docker compose down -v           # equivalent here: the stack declares no volumes to drop
 ```
 
-### `.env` is optional — and now safe to copy
+### Environment contract — no `.env` file
 
-`cp .env.example .env` is safe for compose: without it the compose defaults point at
-`config-service:8888`, `discovery-service:8761`, `postgres-inventory`/`postgres-uom:5432`,
-`rabbitmq:5672` and `vault:8200`, and with it you get exactly the same — the four keys that
-are *host-loopback values* are **commented out** in `.env.example`, so the copy cannot
-override compose's container DNS defaults.
+Every value compose interpolates carries a `${VAR:-default}`, and the defaults point at
+container DNS: `config-service:8888`, `discovery-service:8761`, `vault:8200`,
+`rabbitmq:5672`, `postgres-inventory`/`postgres-uom:5432`. The compose defaults are the
+only supported configuration.
 
-Compose auto-loads `.env` from this directory, and `.env` beats the compose defaults. That
-is precisely why those four keys (`CONFIG_URI`, `EUREKA_URI`, `VAULT_URI`,
-`SPRING_RABBITMQ_HOST`) are commented out rather than active: if you uncomment them (or
-copy them in from somewhere else), the loopbacks are injected into the containers, where
-`localhost` is the container itself and not the sibling service — the business services
-then cannot reach the config server, Eureka, the broker or Vault, their health endpoint
-reports `DOWN` (HTTP 503), and `api-gateway` waits forever on its `depends_on`. Leave them
-commented for `docker compose`; they are what you uncomment when you run the services
-**directly on the host** (IDEs, scripts, published container ports).
+Do not add a `.env`: Compose auto-loads one from this directory and it beats the compose
+defaults. A stray `.env` that carries host loopbacks (`localhost`/`127.0.0.1`) injects
+them into the containers, where `localhost` is the container itself — the services then
+cannot reach the config server, Eureka, the broker or Vault, health reports `DOWN`, and
+`api-gateway` waits forever on `depends_on`.
 
-You only need a `.env` at all when you want to change something compose reads, namely:
-
-- `VAULT_DEV_ROOT_TOKEN_ID` (feeds the dev server plus `VAULT_TOKEN`/`SPRING_CLOUD_VAULT_TOKEN` on both business services),
-- `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_MULTIPLE_DATABASES`,
-- `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`.
-
-Editable-but-optional keys are the numeric `SERVER_PORT_*`, `SPRING_DATASOURCE_*` and
-`SPRING_RABBITMQ_*` values, plus `CONFIG_GIT_URI`/`CONFIG_GIT_DEFAULT_LABEL` and `TZ`.
+Explicit shell or command overrides (`VAR=... docker compose up -d`) remain possible for
+local experiments, but they are not a checked-in contract. Use the compose defaults.
 
 Compose never sets `SPRING_PROFILES_ACTIVE`: the three profile-reading services
 (`api-gateway`, `inventory-service`, `unit-of-measure-service`) already default to
@@ -284,7 +271,7 @@ Postgres containers keep their data on the ephemeral tmpfs described in "Ephemer
 directory", and both mount `./postgres/init-multiple-dbs.sh` into
 `/docker-entrypoint-initdb.d/`.
 
-The env names each container reads are the ones documented in `.env.example`
+The env names each container reads are defined as defaults in `compose.yml`
 (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_MULTIPLE_DATABASES`,
 `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`, `VAULT_DEV_ROOT_TOKEN_ID`,
 `CONFIG_GIT_URI`, `SERVER_PORT_*`, `CONFIG_URI`, `EUREKA_URI`, `VAULT_URI`, `VAULT_TOKEN`,
@@ -316,7 +303,7 @@ with `restart: "no"`.
 read-only bind mount of `../centralized-configuration`, relative to `compose.yml`. JGit
 only reads that repo and clones it into the container's own basedir, so `:ro` is enough,
 and the stack works offline with no GitHub credentials. To clone from GitHub or from
-another branch instead, set in `.env`:
+another branch instead, set in the environment:
 
 ```bash
 CONFIG_GIT_URI=https://github.com/elara-app/centralized-configuration.git

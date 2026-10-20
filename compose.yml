@@ -3,13 +3,13 @@
 #   offline validation (no daemon):  docker compose config --quiet
 #   bring-up (needs the daemon):     docker compose up -d --build
 #
-# Every interpolated value carries a `${VAR:-default}`, so the stack is correct
-# with no `.env` at all; `.env` only overrides. The four host-only keys that would
-# override these defaults (CONFIG_URI, EUREKA_URI, VAULT_URI, SPRING_RABBITMQ_HOST)
-# are commented out in `.env.example`, so a verbatim `cp .env.example .env` cannot
-# beat the container DNS defaults below — see README.md, "`.env` is optional".
-# No Java service env value points at `localhost`/`127.0.0.1`: siblings are
-# reached by their compose service name (DNS on `elara-net`). There is
+# Every interpolated value carries a `${VAR:-default}`, so the stack runs with
+# no environment file; there is no checked-in `.env` contract. Explicit shell or
+# command overrides are possible, but the supported configuration is the defaults
+# below. They point at container DNS (sibling service names on `elara-net`), and
+# no Java service env value points at `localhost`/`127.0.0.1`: inside the network
+# `localhost` is the container itself, not the sibling service. See README.md,
+# "Environment contract — no `.env` file". There is
 # deliberately no tenth service in the default stack — the bootstrap loader is
 # profile-gated (see README.md, "Vault bootstrap under compose").
 
@@ -29,8 +29,8 @@ services:
       SERVER_PORT: ${SERVER_PORT_CONFIG:-8888}
       # Offline default: a read-only bind mount of ../centralized-configuration
       # (JGit clones FROM it into the container's own basedir, so `:ro` is fine).
-      # Set CONFIG_GIT_URI/CONFIG_GIT_DEFAULT_LABEL in `.env` to clone from
-      # GitHub or from another branch instead.
+      # Override CONFIG_GIT_URI/CONFIG_GIT_DEFAULT_LABEL in the environment to
+      # clone from GitHub or from another branch instead.
       CONFIG_GIT_URI: ${CONFIG_GIT_URI:-/config-repo}
       SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL: ${CONFIG_GIT_DEFAULT_LABEL:-main}
     volumes:
@@ -311,7 +311,7 @@ services:
       - IPC_LOCK
     environment:
       VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
-      # LITERAL on purpose (not the `.env` value): the healthcheck runs the Vault
+      # LITERAL on purpose (not an environment override): the healthcheck runs the Vault
       # CLI inside this container, and the CLI defaults to https while the dev
       # server speaks http. This is the one intentional loopback in the file.
       VAULT_ADDR: http://127.0.0.1:8200

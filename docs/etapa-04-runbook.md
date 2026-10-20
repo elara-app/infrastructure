@@ -45,7 +45,6 @@ via `sh ./mvnw`, never `chmod +x` in the repo.
 
 ```bash
 cd infra
-cp .env.example .env          # optional; defaults are compose-safe (container DNS)
 docker compose up -d --build postgres-inventory postgres-uom rabbitmq vault   # +~20s
 docker compose up -d --build discovery-service                                 # wait :8761/ 200 (<=90s)
 docker compose up -d --build config-service                                    # wait :8888/actuator/health (<=120s)
@@ -137,7 +136,7 @@ Note: the Config Server does not serve the working tree — it JGit-**clones** `
 `CONFIG_GIT_DEFAULT_LABEL` (default `main`, `config-service/src/main/resources/
 application.yml:11` — verified: response `version` = local `main` tip) lazily on the first
 request (`clone-on-start:false`). To serve the `develop` branch instead, set
-`CONFIG_GIT_DEFAULT_LABEL=develop` in `.env`.
+`CONFIG_GIT_DEFAULT_LABEL=develop` in the environment.
 
 ## E5 — Eureka: 3 applications UP
 
@@ -321,7 +320,7 @@ clone + JPA `ddl-auto: update` + seed + Eureka registration). FAIL → R8 (never
 | E3 `pg_isready -h localhost -p 5432`, `psql -h localhost` | `docker compose exec postgres-*` (5432 is not published) |
 | E3 `curl -u guest:guest :15672` | `elara:elara` (RABBITMQ_DEFAULT_USER/PASS; plan's own "post I-02" note) |
 | E6 criterion "2/2 `OK`" (two `kv get`s — the plan already says "con las 4 keys") | each secret holds **4 keys** — datasource username/password + rabbit username/password (`jq 'keys|length' service-secrets/*-dev-secrets.json` → 4); E6 must assert all four per service, for the two services |
-| E3 Vault token `00000000-…` | `$VAULT_DEV_ROOT_TOKEN_ID` (defaults to the same dummy; set it in `.env` to change) |
+| E3 Vault token `00000000-…` | `$VAULT_DEV_ROOT_TOKEN_ID` (defaults to the same dummy; override it explicitly in the environment to change) |
 | E5 asserts instance counts | count **application NAMES** (`instance-id` contains `${random.uuid}`) |
 | E8 `StripPrefix=2` | `StripPrefix=3` (ETAPA-01 ruling, verified) |
 | §puertos "inventory/uom `0` aleatorio" | fixed `8081/8082` via `SERVER_PORT` (ETAPA-01/C-11) |
@@ -336,4 +335,4 @@ the business services reseed on every start (idempotent); after a non-cascading 
 restart, restart the business services to re-create schema + seed; the Config Server does
 not serve the working tree — it JGit-**clones** from the bind mount at
 `CONFIG_GIT_DEFAULT_LABEL` (default `main`, verified against the local `main` tip), so set
-`CONFIG_GIT_DEFAULT_LABEL=develop` in `.env` to serve the develop branch.
+`CONFIG_GIT_DEFAULT_LABEL=develop` in the environment to serve the develop branch.
