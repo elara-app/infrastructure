@@ -294,7 +294,7 @@ services:
       - elara-net
 
   vault:
-    image: hashicorp/vault:1.16.3
+    image: hashicorp/vault:2.2.0
     ports:
       - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_VAULT:-8200}:8200"
     expose:
@@ -323,7 +323,7 @@ services:
 
   # One-shot bootstrap: seeds both service secret paths, verifies them, exits.
   vault-loader:
-    image: hashicorp/vault:1.16.3
+    image: hashicorp/vault:2.2.0
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
