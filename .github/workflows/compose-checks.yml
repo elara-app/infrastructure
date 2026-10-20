@@ -118,6 +118,9 @@ jobs:
             [.services["postgres-inventory"].mem_limit,
              .services["postgres-uom"].mem_limit] == ["536870912", "536870912"]'
 
+          check "vault caps memory at 512 MiB" '
+            .services.vault.mem_limit == "536870912"'
+
           check "published ports are the eight expected loopback mappings" '
             ([.services[] | (.ports // [])[]
               | "\(.host_ip):\(.published):\(.target)"] | sort) == [

@@ -49,6 +49,25 @@ compose() {
   docker compose -p elara-demo -f "$COMPOSE_REF" "$@"
 }
 
+# On a failed `compose up`, print the container state and recent Vault logs so
+# startup failures (for example an OOM kill) are diagnosable from CI output.
+# Vault dev-mode logs include the root token and unseal key, so any such line
+# is filtered out before printing.
+compose_diagnostics() {
+  printf 'smoke-test: compose up failed; container state follows\n' >&2
+  compose ps -a >&2 || true
+
+  vault_id=$(compose ps -q vault 2>/dev/null || true)
+  if [ -n "$vault_id" ]; then
+    docker inspect --format \
+      'smoke-test: vault state={{.State.Status}} running={{.State.Running}} exitCode={{.State.ExitCode}} oomKilled={{.State.OOMKilled}} error={{.State.Error}}' \
+      "$vault_id" >&2 || true
+    printf 'smoke-test: vault logs, last 30 lines, secrets filtered\n' >&2
+    compose logs --no-log-prefix --tail 30 vault 2>&1 \
+      | grep -viE 'root token|unseal key' >&2 || true
+  fi
+}
+
 ELARA_BIND=${ELARA_BIND:-127.0.0.1}
 ELARA_PORT_GATEWAY=${ELARA_PORT_GATEWAY:-8080}
 ELARA_PORT_DISCOVERY=${ELARA_PORT_DISCOVERY:-8761}
@@ -81,7 +100,10 @@ if [ "${SMOKE_SKIP_UP:-0}" = "1" ]; then
   printf 'smoke-test: SMOKE_SKIP_UP=1, using the running stack\n'
 else
   printf 'smoke-test: bringing the stack up\n'
-  compose up -d --wait -y --pull always --wait-timeout 900 || die "compose up failed"
+  if ! compose up -d --wait -y --pull always --wait-timeout 900; then
+    compose_diagnostics
+    die "compose up failed"
+  fi
 fi
 
 # wait_for_json <label> <url> <jq filter>
