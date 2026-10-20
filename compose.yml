@@ -278,7 +278,7 @@ services:
       - elara-net
 
   rabbitmq:
-    image: rabbitmq:3.13.7-management-alpine
+    image: rabbitmq:4.3.6-management-alpine
     ports:
       - "5672:5672"
       - "15672:15672"
