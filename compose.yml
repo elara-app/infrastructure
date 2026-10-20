@@ -76,6 +76,8 @@ services:
       - "8080:8080"
     expose:
       - "8080"
+    labels:
+      com.elara.demo.release: "2026-10-20"
     environment:
       JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
       SERVER_PORT: ${SERVER_PORT_GATEWAY:-8080}
