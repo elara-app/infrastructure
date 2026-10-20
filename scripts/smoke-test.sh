@@ -156,6 +156,8 @@ vault_token=$(compose exec -T vault sh -c 'printf %s "$VAULT_DEV_ROOT_TOKEN_ID"'
 for path in secret/inventory-service/dev secret/unit-of-measure-service/dev; do
   secret=$(compose exec -T -e VAULT_TOKEN="$vault_token" vault vault kv get -format=json "$path") \
     || die "vault kv get failed for $path"
+  [ -n "$secret" ] \
+    || die "vault kv get returned empty output for $path"
   missing_keys=$(printf '%s' "$secret" | jq -r '
     (.data.data // {}) as $data
     | (["spring.datasource.username",
