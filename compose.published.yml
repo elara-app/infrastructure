@@ -310,7 +310,7 @@ services:
       retries: 10
       start_period: 20s
     restart: unless-stopped
-    mem_limit: 128M
+    mem_limit: 512M
     logging:
       driver: json-file
       options:
