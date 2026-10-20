@@ -33,6 +33,8 @@ jobs:
           ELARA_PORT_RABBITMQ_MGMT=15674 \
           ELARA_PORT_VAULT=18200 \
           docker compose -f compose.published.yml config --format json > /tmp/published-overrides.json
+      - name: Render published compose with local logs overlay
+        run: docker compose -f compose.published.yml -f compose.logs.yml config --format json > /tmp/published-logs.json
       - name: Assert published compose contract
         shell: bash
         run: |
@@ -353,3 +355,124 @@ jobs:
           fi
 
           echo "published compose: ${checked} assertions passed"
+      - name: Assert logs overlay contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          overlay=/tmp/published-logs.json
+          base=/tmp/published.json
+          checked=0
+
+          check() {
+            local label="$1"
+            local filter="$2"
+            if ! jq -e --slurpfile base "$base" "$filter" "$overlay" >/dev/null; then
+              echo "::error::logs overlay assertion failed: $label" >&2
+              exit 1
+            fi
+            checked=$((checked + 1))
+          }
+
+          check "exactly eleven services including dozzle" '
+            (.services | keys | sort) == [
+              "api-gateway",
+              "config-service",
+              "discovery-service",
+              "dozzle",
+              "inventory-service",
+              "postgres-inventory",
+              "postgres-uom",
+              "rabbitmq",
+              "unit-of-measure-service",
+              "vault",
+              "vault-loader"
+            ]'
+
+          check "project name and bridge network are unchanged" '
+            .name == "elara-demo"
+            and (.networks | keys) == ["elara-net"]
+            and .networks["elara-net"].driver == "bridge"'
+
+          check "overlay adds no top-level volumes, configs, or secrets" '
+            ([.volumes, .configs, .secrets] | map(. // {} | length) | add) == 0'
+
+          check "the dozzle socket is the only overlay bind mount" '
+            ([.services[] | (.volumes // [])[] | select(.type != "tmpfs")
+              | "\(.source):\(.target):\(.read_only)"] | sort) == [
+              "/var/run/docker.sock:/var/run/docker.sock:true"
+            ]'
+
+          check "dozzle uses the exact pinned multi-arch image" '
+            .services.dozzle.image == "amir20/dozzle:v11.3.3"'
+
+          # shellcheck disable=SC2016
+          check "dozzle publishes only loopback 9999 to 8080" '
+            .services.dozzle.ports as $ports
+            | ($ports | length) == 1
+              and $ports[0].host_ip == "127.0.0.1"
+              and $ports[0].published == "9999"
+              and $ports[0].target == 8080
+              and $ports[0].protocol == "tcp"'
+
+          # shellcheck disable=SC2016
+          check "dozzle mounts the Docker socket read-only" '
+            .services.dozzle.volumes as $volumes
+            | ($volumes | length) == 1
+              and $volumes[0].type == "bind"
+              and $volumes[0].source == "/var/run/docker.sock"
+              and $volumes[0].target == "/var/run/docker.sock"
+              and $volumes[0].read_only == true'
+
+          check "dozzle disables actions and shell and opts out of analytics" '
+            .services.dozzle.environment == {
+              "DOZZLE_ENABLE_ACTIONS": "false",
+              "DOZZLE_ENABLE_SHELL": "false",
+              "DOZZLE_NO_ANALYTICS": "true"
+            }'
+
+          # shellcheck disable=SC2016
+          check "dozzle healthcheck matches the pinned contract" '
+            .services.dozzle.healthcheck as $hc
+            | $hc.test == ["CMD", "/dozzle", "healthcheck"]
+              and $hc.interval == "5s"
+              and $hc.timeout == "30s"
+              and $hc.retries == 5
+              and $hc.start_period == "30s"
+              and ($hc.disable // false) != true'
+
+          check "dozzle joins elara-net with unless-stopped restart" '
+            (.services.dozzle.networks | keys) == ["elara-net"]
+            and .services.dozzle.restart == "unless-stopped"'
+
+          check "dozzle adds no build, env_file, configs, or secrets" '
+            .services.dozzle
+            | (has("build") or has("env_file") or has("configs") or has("secrets")) | not'
+
+          # shellcheck disable=SC2016
+          check "base ten services are unchanged by the overlay" '
+            (.services | del(.dozzle)) == ($base[0].services)'
+
+          check "base ten service keys and environments survive the overlay" '
+            (.services | del(.dozzle) | keys | sort) == [
+              "api-gateway",
+              "config-service",
+              "discovery-service",
+              "inventory-service",
+              "postgres-inventory",
+              "postgres-uom",
+              "rabbitmq",
+              "unit-of-measure-service",
+              "vault",
+              "vault-loader"
+            ]
+            and .services["inventory-service"].environment.SPRING_DATASOURCE_URL == "jdbc:postgresql://postgres-inventory:5432/inventory_db"
+            and .services["unit-of-measure-service"].environment.SPRING_DATASOURCE_URL == "jdbc:postgresql://postgres-uom:5432/unit_of_measure_db"
+            and .services["api-gateway"].environment.CONFIG_URI == "http://config-service:8888"
+            and .services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL == "main"
+            and .services["vault-loader"].environment.VAULT_ADDR == "http://vault:8200"
+            and .services["postgres-inventory"].environment.POSTGRES_DB == "inventory_db"
+            and .services["rabbitmq"].environment.RABBITMQ_DEFAULT_USER == "elara"'
+
+          rm -f /tmp/published-logs.json
+
+          echo "logs overlay: ${checked} assertions passed"
