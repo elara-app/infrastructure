@@ -1,0 +1,358 @@
+# Elara consumer stack — pull-only, self-contained, ten services.
+#
+#   docker compose -f compose.published.yml config --quiet
+#   docker compose -f compose.published.yml up -d
+#
+# Images come from GHCR; there are no build contexts, bind mounts, env files,
+# configs, or secrets. All state is ephemeral (Postgres uses tmpfs) and the
+# Vault loader seeds the two service secret paths before inventory and
+# unit-of-measure start.
+#
+# Host ports bind to loopback by default. Override the bind address with
+# ELARA_BIND and individual host ports with the ELARA_PORT_* variables.
+
+name: elara-demo
+
+services:
+  # --- Java services ---------------------------------------------------------
+
+  config-service:
+    image: ghcr.io/elara-app/config-service:latest
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_CONFIG:-8888}:8888"
+    expose:
+      - "8888"
+    environment:
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
+      SERVER_PORT: "8888"
+      SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL: main
+      SPRING_CLOUD_CONFIG_SERVER_GIT_CLONE_ON_START: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+    mem_limit: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  discovery-service:
+    image: ghcr.io/elara-app/discovery-service:latest
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_DISCOVERY:-8761}:8761"
+    expose:
+      - "8761"
+    environment:
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
+      SERVER_PORT: "8761"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8761/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    mem_limit: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  api-gateway:
+    image: ghcr.io/elara-app/api-gateway:latest
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_GATEWAY:-8080}:8080"
+    expose:
+      - "8080"
+    environment:
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
+      SERVER_PORT: "8080"
+      CONFIG_URI: http://config-service:8888
+      EUREKA_URI: http://discovery-service:8761/eureka/
+    depends_on:
+      config-service:
+        condition: service_healthy
+      discovery-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+      unit-of-measure-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    mem_limit: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  inventory-service:
+    image: ghcr.io/elara-app/inventory-service:latest
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_INVENTORY:-8081}:8081"
+    expose:
+      - "8081"
+    environment:
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
+      SERVER_PORT: "8081"
+      CONFIG_URI: http://config-service:8888
+      EUREKA_URI: http://discovery-service:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-inventory:5432/inventory_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: "5672"
+      SPRING_RABBITMQ_USERNAME: elara
+      SPRING_RABBITMQ_PASSWORD: elara
+      VAULT_URI: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+      SPRING_CLOUD_VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+    depends_on:
+      config-service:
+        condition: service_healthy
+      discovery-service:
+        condition: service_healthy
+      postgres-inventory:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      vault-loader:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+    mem_limit: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  unit-of-measure-service:
+    image: ghcr.io/elara-app/unit-of-measure-service:latest
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_UOM:-8082}:8082"
+    expose:
+      - "8082"
+    environment:
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=75
+      SERVER_PORT: "8082"
+      CONFIG_URI: http://config-service:8888
+      EUREKA_URI: http://discovery-service:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-uom:5432/unit_of_measure_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: "5672"
+      SPRING_RABBITMQ_USERNAME: elara
+      SPRING_RABBITMQ_PASSWORD: elara
+      VAULT_URI: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+      SPRING_CLOUD_VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+    depends_on:
+      config-service:
+        condition: service_healthy
+      discovery-service:
+        condition: service_healthy
+      postgres-uom:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      vault-loader:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+    mem_limit: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  # --- Infrastructure services ----------------------------------------------
+
+  postgres-inventory:
+    image: postgres:16.15-alpine
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: inventory_db
+    volumes:
+      - type: tmpfs
+        target: /var/lib/postgresql/data
+        tmpfs:
+          size: 134217728
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  postgres-uom:
+    image: postgres:16.15-alpine
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: unit_of_measure_db
+    volumes:
+      - type: tmpfs
+        target: /var/lib/postgresql/data
+        tmpfs:
+          size: 134217728
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  rabbitmq:
+    image: rabbitmq:3.13.7-management-alpine
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ:-5672}:5672"
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ_MGMT:-15672}:15672"
+    expose:
+      - "5672"
+      - "15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: elara
+      RABBITMQ_DEFAULT_PASS: elara
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+    mem_limit: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  vault:
+    image: hashicorp/vault:1.16.3
+    ports:
+      - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_VAULT:-8200}:8200"
+    expose:
+      - "8200"
+    command: ["server", "-dev", "-dev-root-token-id=${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}"]
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+      VAULT_ADDR: http://127.0.0.1:8200
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    mem_limit: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+  # One-shot bootstrap: seeds both service secret paths, verifies them, exits.
+  vault-loader:
+    image: hashicorp/vault:1.16.3
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        vault kv put secret/inventory-service/dev \
+          spring.datasource.username=postgres \
+          spring.datasource.password=postgres \
+          spring.rabbitmq.username=elara \
+          spring.rabbitmq.password=elara
+        vault kv put secret/unit-of-measure-service/dev \
+          spring.datasource.username=postgres \
+          spring.datasource.password=postgres \
+          spring.rabbitmq.username=elara \
+          spring.rabbitmq.password=elara
+        vault kv get secret/inventory-service/dev >/dev/null
+        vault kv get secret/unit-of-measure-service/dev >/dev/null
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-00000000-0000-0000-0000-000000000000}
+    depends_on:
+      vault:
+        condition: service_healthy
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - elara-net
+
+networks:
+  elara-net:
+    driver: bridge
