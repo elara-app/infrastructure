@@ -1,0 +1,700 @@
+name: Publish compose
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-compose-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      short_sha: ${{ steps.context.outputs.short_sha }}
+      config_sha: ${{ steps.context.outputs.config_sha }}
+      is_current: ${{ steps.context.outputs.is_current }}
+    steps:
+      - name: Resolve artifact refs
+        id: context
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          if ! [[ "$short_sha" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "::error::GITHUB_SHA does not begin with 7 hex characters: $GITHUB_SHA"
+            exit 1
+          fi
+          config_sha=$(git ls-remote https://github.com/elara-app/centralized-configuration.git refs/heads/main | awk '{print $1}')
+          if ! [[ "$config_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve a 40-hex config SHA (got: '$config_sha')"
+            exit 1
+          fi
+          infra_sha=$(git ls-remote https://github.com/elara-app/infrastructure.git refs/heads/main | awk '{print $1}')
+          if ! [[ "$infra_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve a 40-hex infrastructure main SHA (got: '$infra_sha')"
+            exit 1
+          fi
+          is_current=false
+          if [ "$infra_sha" = "$GITHUB_SHA" ]; then
+            is_current=true
+          fi
+          {
+            printf 'short_sha=%s\n' "$short_sha"
+            printf 'config_sha=%s\n' "$config_sha"
+            printf 'is_current=%s\n' "$is_current"
+          } >> "$GITHUB_OUTPUT"
+          printf 'short SHA: %s\nconfig SHA: %s\ninfrastructure main SHA: %s\nis current run: %s\n' \
+            "$short_sha" "$config_sha" "$infra_sha" "$is_current"
+
+  preflight:
+    name: Preflight
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
+      XDG_CACHE_HOME: ${{ github.workspace }}/../cache
+      SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+      CONFIG_SHA: ${{ needs.prepare.outputs.config_sha }}
+    outputs:
+      exists: ${{ steps.existing.outputs.exists }}
+      short_sha: ${{ needs.prepare.outputs.short_sha }}
+      config_sha: ${{ needs.prepare.outputs.config_sha }}
+      is_current: ${{ needs.prepare.outputs.is_current }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Docker Compose 2.40.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$DOCKER_CONFIG/cli-plugins" "$XDG_CACHE_HOME"
+          case "$(uname -m)" in
+            x86_64)
+              asset=docker-compose-linux-x86_64
+              sha256=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372
+              ;;
+            aarch64|arm64)
+              asset=docker-compose-linux-aarch64
+              sha256=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137
+              ;;
+            *)
+              echo "::error::unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          compose="$RUNNER_TEMP/bin/docker-compose"
+          curl -fsSL --retry 3 --retry-all-errors \
+            "https://github.com/docker/compose/releases/download/v2.40.3/${asset}" \
+            -o "$compose"
+          printf '%s  %s\n' "$sha256" "$compose" | sha256sum -c -
+          chmod +x "$compose"
+          ln -sf "$compose" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          version=$(docker compose version)
+          printf '%s\n' "$version"
+          if [[ "$version" != *"v2.40.3"* ]]; then
+            echo "::error::expected Docker Compose v2.40.3, got: $version"
+            exit 1
+          fi
+
+      - name: Assert the published compose is self-contained
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f compose.published.yml config --format json > "$RUNNER_TEMP/published.json"
+          assert() {
+            local message="$1"
+            shift
+            if ! jq -e "$@" "$RUNNER_TEMP/published.json" >/dev/null; then
+              echo "::error::$message"
+              exit 1
+            fi
+          }
+          assert 'expected exactly ten services' '.services | length == 10'
+          assert 'expected the ten elara-demo services' \
+            '(.services | keys) == ["api-gateway", "config-service", "discovery-service", "inventory-service", "postgres-inventory", "postgres-uom", "rabbitmq", "unit-of-measure-service", "vault", "vault-loader"]'
+          assert 'expected no top-level volumes, configs, or secrets' \
+            '((.volumes // {}) | length) == 0 and ((.configs // {}) | length) == 0 and ((.secrets // {}) | length) == 0'
+          assert 'expected no service build sections' \
+            '[.services[] | select(has("build"))] | length == 0'
+          assert 'expected no env_file references' \
+            '[.services[] | select(has("env_file"))] | length == 0'
+          assert 'expected no service configs or secrets' \
+            '[.services[] | select(has("configs") or has("secrets"))] | length == 0'
+          assert 'expected every mount to be tmpfs' \
+            '[.services[] | (.volumes // [])[] | select(.type != "tmpfs")] | length == 0'
+
+      - name: Verify configuration pins container endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          for service in api-gateway inventory-service unit-of-measure-service; do
+            url="https://raw.githubusercontent.com/elara-app/centralized-configuration/${CONFIG_SHA}/${service}-dev.yml"
+            file="$RUNNER_TEMP/${service}-dev.yml"
+            curl -fsSL --retry 3 --retry-all-errors "$url" -o "$file"
+            if ! grep -qF "\${EUREKA_URI:" "$file"; then
+              echo "::error::${service}-dev.yml at ${CONFIG_SHA} does not contain the \${EUREKA_URI: placeholder"
+              exit 1
+            fi
+          done
+
+      - name: Verify service images are multi-architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          for service in config-service discovery-service api-gateway inventory-service unit-of-measure-service; do
+            ref="ghcr.io/elara-app/${service}:latest"
+            if ! raw=$(docker buildx imagetools inspect --raw "$ref" 2>"$RUNNER_TEMP/imagetools.err"); then
+              cat "$RUNNER_TEMP/imagetools.err" >&2
+              echo "::error::could not inspect $ref anonymously"
+              exit 1
+            fi
+            if ! jq -e '
+              [.manifests[]? | select(.platform.os == "linux") | .platform.architecture] as $arch
+              | ($arch | index("amd64")) != null and ($arch | index("arm64")) != null
+            ' <<<"$raw" >/dev/null; then
+              echo "::error::$ref does not publish both linux/amd64 and linux/arm64"
+              exit 1
+            fi
+          done
+
+      - name: Check whether the sha artifact already exists
+        id: existing
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          package_url="https://api.github.com/repos/elara-app/infrastructure/packages/container/elara-demo"
+          status=$(curl -sS -L -o "$RUNNER_TEMP/package.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "$package_url")
+          case "$status" in
+            404)
+              printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+              printf 'package absent: elara-demo\n'
+              ;;
+            200)
+              ref="oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
+              if docker compose -f "$ref" config --format json >/dev/null 2>"$RUNNER_TEMP/existing-tag.err"; then
+                printf 'exists=true\n' >> "$GITHUB_OUTPUT"
+                printf 'existing artifact: %s\n' "$ref"
+              else
+                cat "$RUNNER_TEMP/existing-tag.err" >&2
+                if grep -qiE 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/existing-tag.err"; then
+                  printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+                  printf 'artifact absent: %s\n' "$ref"
+                else
+                  echo "::error::$ref may exist but is not anonymously readable; do not publish over it"
+                  exit 1
+                fi
+              fi
+              ;;
+            *)
+              cat "$RUNNER_TEMP/package.json" >&2 || true
+              echo "::error::could not determine whether the elara-demo package exists (HTTP $status)"
+              exit 1
+              ;;
+          esac
+
+  publish-sha:
+    name: Publish sha artifact
+    needs: preflight
+    if: needs.preflight.outputs.exists != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
+      XDG_CACHE_HOME: ${{ github.workspace }}/../cache
+      SHORT_SHA: ${{ needs.preflight.outputs.short_sha }}
+      CONFIG_SHA: ${{ needs.preflight.outputs.config_sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Docker Compose 2.40.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$DOCKER_CONFIG/cli-plugins" "$XDG_CACHE_HOME"
+          case "$(uname -m)" in
+            x86_64)
+              asset=docker-compose-linux-x86_64
+              sha256=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372
+              ;;
+            aarch64|arm64)
+              asset=docker-compose-linux-aarch64
+              sha256=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137
+              ;;
+            *)
+              echo "::error::unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          compose="$RUNNER_TEMP/bin/docker-compose"
+          curl -fsSL --retry 3 --retry-all-errors \
+            "https://github.com/docker/compose/releases/download/v2.40.3/${asset}" \
+            -o "$compose"
+          printf '%s  %s\n' "$sha256" "$compose" | sha256sum -c -
+          chmod +x "$compose"
+          ln -sf "$compose" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          version=$(docker compose version)
+          printf '%s\n' "$version"
+          if [[ "$version" != *"v2.40.3"* ]]; then
+            echo "::error::expected Docker Compose v2.40.3, got: $version"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Write the config pin override
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$CONFIG_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::config SHA is not 40 hex characters: $CONFIG_SHA"
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/config-pin.yml" <<EOF
+          services:
+            config-service:
+              environment:
+                SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL: "${CONFIG_SHA}"
+          EOF
+          cat "$RUNNER_TEMP/config-pin.yml"
+          rendered=$(docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
+            config --format json \
+            | jq -r '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL')
+          if [ "$rendered" != "$CONFIG_SHA" ]; then
+            echo "::error::config pin render is '$rendered', expected '$CONFIG_SHA'"
+            exit 1
+          fi
+          printf 'config pin verified: %s\n' "$rendered"
+
+      - name: Publish the sha artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          record_digest() {
+            local label="$1"
+            local ref="$2"
+            local digest
+            if ! digest=$(docker buildx imagetools inspect --raw "$ref" 2>"$RUNNER_TEMP/record-digest.err" | sha256sum | awk '{print $1}'); then
+              cat "$RUNNER_TEMP/record-digest.err" >&2 || true
+              echo "::error::could not inspect $ref to record its digest"
+              return 1
+            fi
+            if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid artifact digest for $ref: $digest"
+              return 1
+            fi
+            printf '%s artifact: %s\n' "$label" "$digest"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '%s artifact: %s\n' "$label" "$digest" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "::warning::could not write the artifact digest to the step summary"
+            fi
+          }
+          ref="ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
+          docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
+            publish -y --resolve-image-digests "$ref"
+          record_digest sha "$ref"
+
+  verify-sha:
+    name: Verify sha artifact
+    needs: [preflight, publish-sha]
+    if: always() && needs.preflight.result == 'success' && (needs.preflight.outputs.exists == 'true' || needs.publish-sha.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
+      XDG_CACHE_HOME: ${{ github.workspace }}/../cache
+      SHORT_SHA: ${{ needs.preflight.outputs.short_sha }}
+      CONFIG_SHA: ${{ needs.preflight.outputs.config_sha }}
+      EXISTS: ${{ needs.preflight.outputs.exists }}
+    steps:
+      - name: Install Docker Compose 2.40.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$DOCKER_CONFIG/cli-plugins" "$XDG_CACHE_HOME"
+          case "$(uname -m)" in
+            x86_64)
+              asset=docker-compose-linux-x86_64
+              sha256=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372
+              ;;
+            aarch64|arm64)
+              asset=docker-compose-linux-aarch64
+              sha256=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137
+              ;;
+            *)
+              echo "::error::unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          compose="$RUNNER_TEMP/bin/docker-compose"
+          curl -fsSL --retry 3 --retry-all-errors \
+            "https://github.com/docker/compose/releases/download/v2.40.3/${asset}" \
+            -o "$compose"
+          printf '%s  %s\n' "$sha256" "$compose" | sha256sum -c -
+          chmod +x "$compose"
+          ln -sf "$compose" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          version=$(docker compose version)
+          printf '%s\n' "$version"
+          if [[ "$version" != *"v2.40.3"* ]]; then
+            echo "::error::expected Docker Compose v2.40.3, got: $version"
+            exit 1
+          fi
+
+      - name: Verify the sha artifact structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
+          docker compose -f "$ref" config --format json > "$RUNNER_TEMP/sha-artifact.json"
+          assert() {
+            local message="$1"
+            shift
+            if ! jq -e "$@" "$RUNNER_TEMP/sha-artifact.json" >/dev/null; then
+              echo "::error::$message"
+              exit 1
+            fi
+          }
+          assert 'expected exactly ten services in the sha artifact' '.services | length == 10'
+          assert 'expected ten digest-pinned service images' \
+            '[.services[].image | select(test("@sha256:[0-9a-f]{64}$"))] | length == 10'
+          assert 'expected a 40-hex config label' \
+            '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL | test("^[0-9a-f]{40}$")'
+          if [ "${EXISTS:-}" != 'true' ]; then
+            actual_label=$(jq -r \
+              '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL' \
+              "$RUNNER_TEMP/sha-artifact.json")
+            if [ "$actual_label" != "$CONFIG_SHA" ]; then
+              echo "::error::newly published config label '$actual_label' does not match CONFIG_SHA '$CONFIG_SHA'"
+              exit 1
+            fi
+            printf 'newly published config label matches CONFIG_SHA: %s\n' "$actual_label"
+          fi
+
+          while IFS= read -r image; do
+            if ! raw=$(docker buildx imagetools inspect --raw "$image" 2>"$RUNNER_TEMP/imagetools.err"); then
+              cat "$RUNNER_TEMP/imagetools.err" >&2
+              echo "::error::could not inspect $image anonymously"
+              exit 1
+            fi
+            if ! jq -e '
+              [.manifests[]? | select(.platform.os == "linux") | .platform.architecture] as $arch
+              | ($arch | index("amd64")) != null and ($arch | index("arm64")) != null
+            ' <<<"$raw" >/dev/null; then
+              echo "::error::$image does not publish both linux/amd64 and linux/arm64"
+              exit 1
+            fi
+            if ! digest=$(docker buildx imagetools inspect --raw "$image" 2>"$RUNNER_TEMP/image-digest.err" | sha256sum | awk '{print $1}'); then
+              cat "$RUNNER_TEMP/image-digest.err" >&2 || true
+              echo "::error::could not inspect $image to record its digest"
+              exit 1
+            fi
+            if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid image digest for $image: $digest"
+              exit 1
+            fi
+            printf 'image %s: sha256:%s\n' "$image" "$digest"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf 'image %s: sha256:%s\n' "$image" "$digest" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "::warning::could not write the image digest to the step summary"
+            fi
+          done < <(jq -r '.services[].image' "$RUNNER_TEMP/sha-artifact.json")
+
+          record_digest() {
+            local label="$1"
+            local ref="$2"
+            local digest
+            if ! digest=$(docker buildx imagetools inspect --raw "$ref" 2>"$RUNNER_TEMP/record-digest.err" | sha256sum | awk '{print $1}'); then
+              cat "$RUNNER_TEMP/record-digest.err" >&2 || true
+              echo "::error::could not inspect $ref to record its digest"
+              return 1
+            fi
+            if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid artifact digest for $ref: $digest"
+              return 1
+            fi
+            printf '%s artifact: %s\n' "$label" "$digest"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '%s artifact: %s\n' "$label" "$digest" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "::warning::could not write the artifact digest to the step summary"
+            fi
+          }
+          record_digest sha "ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
+
+  smoke-sha:
+    name: Smoke sha artifact
+    needs: [preflight, publish-sha, verify-sha]
+    if: always() && needs.preflight.result == 'success' && needs.verify-sha.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
+      XDG_CACHE_HOME: ${{ github.workspace }}/../cache
+      SHORT_SHA: ${{ needs.preflight.outputs.short_sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Docker Compose 2.40.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$DOCKER_CONFIG/cli-plugins" "$XDG_CACHE_HOME"
+          case "$(uname -m)" in
+            x86_64)
+              asset=docker-compose-linux-x86_64
+              sha256=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372
+              ;;
+            aarch64|arm64)
+              asset=docker-compose-linux-aarch64
+              sha256=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137
+              ;;
+            *)
+              echo "::error::unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          compose="$RUNNER_TEMP/bin/docker-compose"
+          curl -fsSL --retry 3 --retry-all-errors \
+            "https://github.com/docker/compose/releases/download/v2.40.3/${asset}" \
+            -o "$compose"
+          printf '%s  %s\n' "$sha256" "$compose" | sha256sum -c -
+          chmod +x "$compose"
+          ln -sf "$compose" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          version=$(docker compose version)
+          printf '%s\n' "$version"
+          if [[ "$version" != *"v2.40.3"* ]]; then
+            echo "::error::expected Docker Compose v2.40.3, got: $version"
+            exit 1
+          fi
+
+      - name: Smoke the sha artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPOSE_REF="oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}" \
+            bash scripts/smoke-test.sh
+
+  publish-latest:
+    name: Publish latest artifact
+    needs: [preflight, smoke-sha]
+    if: needs.smoke-sha.result == 'success' && needs.preflight.outputs.is_current == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
+      XDG_CACHE_HOME: ${{ github.workspace }}/../cache
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Docker Compose 2.40.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$DOCKER_CONFIG/cli-plugins" "$XDG_CACHE_HOME"
+          case "$(uname -m)" in
+            x86_64)
+              asset=docker-compose-linux-x86_64
+              sha256=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372
+              ;;
+            aarch64|arm64)
+              asset=docker-compose-linux-aarch64
+              sha256=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137
+              ;;
+            *)
+              echo "::error::unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          compose="$RUNNER_TEMP/bin/docker-compose"
+          curl -fsSL --retry 3 --retry-all-errors \
+            "https://github.com/docker/compose/releases/download/v2.40.3/${asset}" \
+            -o "$compose"
+          printf '%s  %s\n' "$sha256" "$compose" | sha256sum -c -
+          chmod +x "$compose"
+          ln -sf "$compose" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          version=$(docker compose version)
+          printf '%s\n' "$version"
+          if [[ "$version" != *"v2.40.3"* ]]; then
+            echo "::error::expected Docker Compose v2.40.3, got: $version"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish the latest artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          record_digest() {
+            local label="$1"
+            local ref="$2"
+            local digest
+            if ! digest=$(docker buildx imagetools inspect --raw "$ref" 2>"$RUNNER_TEMP/record-digest.err" | sha256sum | awk '{print $1}'); then
+              cat "$RUNNER_TEMP/record-digest.err" >&2 || true
+              echo "::error::could not inspect $ref to record its digest"
+              return 1
+            fi
+            if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid artifact digest for $ref: $digest"
+              return 1
+            fi
+            printf '%s artifact: %s\n' "$label" "$digest"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '%s artifact: %s\n' "$label" "$digest" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "::warning::could not write the artifact digest to the step summary"
+            fi
+          }
+          record_image_digest() {
+            local image="$1"
+            local digest
+            if ! digest=$(docker buildx imagetools inspect --raw "$image" 2>"$RUNNER_TEMP/image-digest.err" | sha256sum | awk '{print $1}'); then
+              cat "$RUNNER_TEMP/image-digest.err" >&2 || true
+              echo "::error::could not inspect $image to record its image digest"
+              return 1
+            fi
+            if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid image digest for $image: $digest"
+              return 1
+            fi
+            printf 'image %s: sha256:%s\n' "$image" "$digest"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf 'image %s: sha256:%s\n' "$image" "$digest" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "::warning::could not write the image digest to the step summary"
+            fi
+          }
+          ref="ghcr.io/elara-app/elara-demo:latest"
+          docker compose -f compose.published.yml publish -y "$ref"
+          docker compose -f "oci://${ref}" config --format json > "$RUNNER_TEMP/latest-artifact.json"
+          assert() {
+            local message="$1"
+            shift
+            if ! jq -e "$@" "$RUNNER_TEMP/latest-artifact.json" >/dev/null; then
+              echo "::error::$message"
+              exit 1
+            fi
+          }
+          assert 'expected exactly ten services in the latest artifact' '.services | length == 10'
+          assert 'expected no digest-pinned service images in the latest artifact' \
+            '[.services[].image | select(test("@sha256:[0-9a-f]{64}$"))] | length == 0'
+          # shellcheck disable=SC2016
+          assert 'expected the five Elara images at :latest' \
+            '.services as $services | ["config-service", "discovery-service", "api-gateway", "inventory-service", "unit-of-measure-service"] | all(.[]; $services[.].image == "ghcr.io/elara-app/\(.):latest")'
+          assert 'expected the latest config label to be main' \
+            '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL == "main"'
+          record_digest latest "$ref"
+          for service in config-service discovery-service api-gateway inventory-service unit-of-measure-service; do
+            image=$(jq -r --arg service "$service" '.services[$service].image' "$RUNNER_TEMP/latest-artifact.json")
+            record_image_digest "$image"
+          done
+
+  smoke-latest:
+    name: Smoke latest artifact (${{ matrix.arch }})
+    needs: publish-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
+      XDG_CACHE_HOME: ${{ github.workspace }}/../cache
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Docker Compose 2.40.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" "$DOCKER_CONFIG/cli-plugins" "$XDG_CACHE_HOME"
+          case "$(uname -m)" in
+            x86_64)
+              asset=docker-compose-linux-x86_64
+              sha256=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372
+              ;;
+            aarch64|arm64)
+              asset=docker-compose-linux-aarch64
+              sha256=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137
+              ;;
+            *)
+              echo "::error::unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+          compose="$RUNNER_TEMP/bin/docker-compose"
+          curl -fsSL --retry 3 --retry-all-errors \
+            "https://github.com/docker/compose/releases/download/v2.40.3/${asset}" \
+            -o "$compose"
+          printf '%s  %s\n' "$sha256" "$compose" | sha256sum -c -
+          chmod +x "$compose"
+          ln -sf "$compose" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+          version=$(docker compose version)
+          printf '%s\n' "$version"
+          if [[ "$version" != *"v2.40.3"* ]]; then
+            echo "::error::expected Docker Compose v2.40.3, got: $version"
+            exit 1
+          fi
+
+      - name: Smoke the latest artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPOSE_REF="oci://ghcr.io/elara-app/elara-demo:latest" \
+            bash scripts/smoke-test.sh
