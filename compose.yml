@@ -325,7 +325,7 @@ services:
       - elara-net
 
   # One-shot Vault bootstrap (profile-gated: hidden from the default 9-service
-  # stack; default `config`/`up` still render exactly 9). CLI 1.16 == server 1.16.
+  # stack; default `config`/`up` still render exactly 9). CLI 1.16.3 == server 1.16.3.
   # Run: sudo docker compose --profile bootstrap up vault-loader
   vault-loader:
     build: ./vault-loader
