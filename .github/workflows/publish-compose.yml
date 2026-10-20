@@ -21,6 +21,7 @@ jobs:
     outputs:
       short_sha: ${{ steps.context.outputs.short_sha }}
       config_sha: ${{ steps.context.outputs.config_sha }}
+      is_current: ${{ steps.context.outputs.is_current }}
     steps:
       - name: Resolve artifact refs
         id: context
@@ -37,9 +38,22 @@ jobs:
             echo "::error::could not resolve a 40-hex config SHA (got: '$config_sha')"
             exit 1
           fi
-          printf 'short_sha=%s\n' "$short_sha" >> "$GITHUB_OUTPUT"
-          printf 'config_sha=%s\n' "$config_sha" >> "$GITHUB_OUTPUT"
-          printf 'short SHA: %s\nconfig SHA: %s\n' "$short_sha" "$config_sha"
+          infra_sha=$(git ls-remote https://github.com/elara-app/infrastructure.git refs/heads/main | awk '{print $1}')
+          if ! [[ "$infra_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve a 40-hex infrastructure main SHA (got: '$infra_sha')"
+            exit 1
+          fi
+          is_current=false
+          if [ "$infra_sha" = "$GITHUB_SHA" ]; then
+            is_current=true
+          fi
+          {
+            printf 'short_sha=%s\n' "$short_sha"
+            printf 'config_sha=%s\n' "$config_sha"
+            printf 'is_current=%s\n' "$is_current"
+          } >> "$GITHUB_OUTPUT"
+          printf 'short SHA: %s\nconfig SHA: %s\ninfrastructure main SHA: %s\nis current run: %s\n' \
+            "$short_sha" "$config_sha" "$infra_sha" "$is_current"
 
   preflight:
     name: Preflight
@@ -48,6 +62,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      packages: read
     env:
       DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
       XDG_CACHE_HOME: ${{ github.workspace }}/../cache
@@ -57,9 +72,12 @@ jobs:
       exists: ${{ steps.existing.outputs.exists }}
       short_sha: ${{ needs.prepare.outputs.short_sha }}
       config_sha: ${{ needs.prepare.outputs.config_sha }}
+      is_current: ${{ needs.prepare.outputs.is_current }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Docker Compose 2.40.3
         shell: bash
@@ -158,22 +176,42 @@ jobs:
       - name: Check whether the sha artifact already exists
         id: existing
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ref="oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
-          if docker compose -f "$ref" config --format json >/dev/null 2>"$RUNNER_TEMP/existing-tag.err"; then
-            printf 'exists=true\n' >> "$GITHUB_OUTPUT"
-            printf 'existing artifact: %s\n' "$ref"
-          else
-            cat "$RUNNER_TEMP/existing-tag.err" >&2
-            if grep -qiE 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/existing-tag.err"; then
+          package_url="https://api.github.com/repos/elara-app/infrastructure/packages/container/elara-demo"
+          status=$(curl -sS -L -o "$RUNNER_TEMP/package.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "$package_url")
+          case "$status" in
+            404)
               printf 'exists=false\n' >> "$GITHUB_OUTPUT"
-              printf 'artifact absent: %s\n' "$ref"
-            else
-              echo "::error::$ref may exist but is not anonymously readable; do not publish over it"
+              printf 'package absent: elara-demo\n'
+              ;;
+            200)
+              ref="oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
+              if docker compose -f "$ref" config --format json >/dev/null 2>"$RUNNER_TEMP/existing-tag.err"; then
+                printf 'exists=true\n' >> "$GITHUB_OUTPUT"
+                printf 'existing artifact: %s\n' "$ref"
+              else
+                cat "$RUNNER_TEMP/existing-tag.err" >&2
+                if grep -qiE 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/existing-tag.err"; then
+                  printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+                  printf 'artifact absent: %s\n' "$ref"
+                else
+                  echo "::error::$ref may exist but is not anonymously readable; do not publish over it"
+                  exit 1
+                fi
+              fi
+              ;;
+            *)
+              cat "$RUNNER_TEMP/package.json" >&2 || true
+              echo "::error::could not determine whether the elara-demo package exists (HTTP $status)"
               exit 1
-            fi
-          fi
+              ;;
+          esac
 
   publish-sha:
     name: Publish sha artifact
@@ -192,6 +230,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Docker Compose 2.40.3
         shell: bash
@@ -245,9 +285,17 @@ jobs:
           services:
             config-service:
               environment:
-                SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL: ${CONFIG_SHA}
+                SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL: "${CONFIG_SHA}"
           EOF
           cat "$RUNNER_TEMP/config-pin.yml"
+          rendered=$(docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
+            config --format json \
+            | jq -r '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL')
+          if [ "$rendered" != "$CONFIG_SHA" ]; then
+            echo "::error::config pin render is '$rendered', expected '$CONFIG_SHA'"
+            exit 1
+          fi
+          printf 'config pin verified: %s\n' "$rendered"
 
       - name: Publish the sha artifact
         shell: bash
@@ -278,9 +326,9 @@ jobs:
           record_digest sha "$ref"
 
   verify-sha:
-    name: Verify existing sha artifact
-    needs: preflight
-    if: needs.preflight.outputs.exists == 'true'
+    name: Verify sha artifact
+    needs: [preflight, publish-sha]
+    if: always() && needs.preflight.result == 'success' && (needs.preflight.outputs.exists == 'true' || needs.publish-sha.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -289,6 +337,8 @@ jobs:
       DOCKER_CONFIG: ${{ github.workspace }}/../docker-config
       XDG_CACHE_HOME: ${{ github.workspace }}/../cache
       SHORT_SHA: ${{ needs.preflight.outputs.short_sha }}
+      CONFIG_SHA: ${{ needs.preflight.outputs.config_sha }}
+      EXISTS: ${{ needs.preflight.outputs.exists }}
     steps:
       - name: Install Docker Compose 2.40.3
         shell: bash
@@ -323,7 +373,7 @@ jobs:
             exit 1
           fi
 
-      - name: Verify the existing artifact structure
+      - name: Verify the sha artifact structure
         shell: bash
         run: |
           set -euo pipefail
@@ -342,6 +392,16 @@ jobs:
             '[.services[].image | select(test("@sha256:[0-9a-f]{64}$"))] | length == 10'
           assert 'expected a 40-hex config label' \
             '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL | test("^[0-9a-f]{40}$")'
+          if [ "${EXISTS:-}" != 'true' ]; then
+            actual_label=$(jq -r \
+              '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL' \
+              "$RUNNER_TEMP/sha-artifact.json")
+            if [ "$actual_label" != "$CONFIG_SHA" ]; then
+              echo "::error::newly published config label '$actual_label' does not match CONFIG_SHA '$CONFIG_SHA'"
+              exit 1
+            fi
+            printf 'newly published config label matches CONFIG_SHA: %s\n' "$actual_label"
+          fi
 
           while IFS= read -r image; do
             if ! raw=$(docker buildx imagetools inspect --raw "$image" 2>"$RUNNER_TEMP/imagetools.err"); then
@@ -355,6 +415,20 @@ jobs:
             ' <<<"$raw" >/dev/null; then
               echo "::error::$image does not publish both linux/amd64 and linux/arm64"
               exit 1
+            fi
+            if ! digest=$(docker buildx imagetools inspect --raw "$image" 2>"$RUNNER_TEMP/image-digest.err" | sha256sum | awk '{print $1}'); then
+              cat "$RUNNER_TEMP/image-digest.err" >&2 || true
+              echo "::error::could not inspect $image to record its digest"
+              exit 1
+            fi
+            if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid image digest for $image: $digest"
+              exit 1
+            fi
+            printf 'image %s: sha256:%s\n' "$image" "$digest"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf 'image %s: sha256:%s\n' "$image" "$digest" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "::warning::could not write the image digest to the step summary"
             fi
           done < <(jq -r '.services[].image' "$RUNNER_TEMP/sha-artifact.json")
 
@@ -382,7 +456,7 @@ jobs:
   smoke-sha:
     name: Smoke sha artifact
     needs: [preflight, publish-sha, verify-sha]
-    if: always() && needs.preflight.result == 'success' && (needs.publish-sha.result == 'success' || needs.verify-sha.result == 'success')
+    if: always() && needs.preflight.result == 'success' && needs.verify-sha.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -394,6 +468,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Docker Compose 2.40.3
         shell: bash
@@ -438,7 +514,7 @@ jobs:
   publish-latest:
     name: Publish latest artifact
     needs: [preflight, smoke-sha]
-    if: needs.smoke-sha.result == 'success'
+    if: needs.smoke-sha.result == 'success' && needs.preflight.outputs.is_current == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -450,6 +526,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Docker Compose 2.40.3
         shell: bash
@@ -514,9 +592,48 @@ jobs:
                 || echo "::warning::could not write the artifact digest to the step summary"
             fi
           }
+          record_image_digest() {
+            local image="$1"
+            local digest
+            if ! digest=$(docker buildx imagetools inspect --raw "$image" 2>"$RUNNER_TEMP/image-digest.err" | sha256sum | awk '{print $1}'); then
+              cat "$RUNNER_TEMP/image-digest.err" >&2 || true
+              echo "::error::could not inspect $image to record its image digest"
+              return 1
+            fi
+            if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid image digest for $image: $digest"
+              return 1
+            fi
+            printf 'image %s: sha256:%s\n' "$image" "$digest"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf 'image %s: sha256:%s\n' "$image" "$digest" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "::warning::could not write the image digest to the step summary"
+            fi
+          }
           ref="ghcr.io/elara-app/elara-demo:latest"
           docker compose -f compose.published.yml publish -y "$ref"
+          docker compose -f "oci://${ref}" config --format json > "$RUNNER_TEMP/latest-artifact.json"
+          assert() {
+            local message="$1"
+            shift
+            if ! jq -e "$@" "$RUNNER_TEMP/latest-artifact.json" >/dev/null; then
+              echo "::error::$message"
+              exit 1
+            fi
+          }
+          assert 'expected exactly ten services in the latest artifact' '.services | length == 10'
+          assert 'expected no digest-pinned service images in the latest artifact' \
+            '[.services[].image | select(test("@sha256:[0-9a-f]{64}$"))] | length == 0'
+          # shellcheck disable=SC2016
+          assert 'expected the five Elara images at :latest' \
+            '.services as $services | ["config-service", "discovery-service", "api-gateway", "inventory-service", "unit-of-measure-service"] | all(.[]; $services[.].image == "ghcr.io/elara-app/\(.):latest")'
+          assert 'expected the latest config label to be main' \
+            '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL == "main"'
           record_digest latest "$ref"
+          for service in config-service discovery-service api-gateway inventory-service unit-of-measure-service; do
+            image=$(jq -r --arg service "$service" '.services[$service].image' "$RUNNER_TEMP/latest-artifact.json")
+            record_image_digest "$image"
+          done
 
   smoke-latest:
     name: Smoke latest artifact (${{ matrix.arch }})
@@ -539,6 +656,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Docker Compose 2.40.3
         shell: bash
