@@ -698,3 +698,51 @@ jobs:
           set -euo pipefail
           COMPOSE_REF="oci://ghcr.io/elara-app/elara-demo:latest" \
             bash scripts/smoke-test.sh
+
+      - name: Start the Dozzle overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -p elara-demo \
+            -f "oci://ghcr.io/elara-app/elara-demo:latest" \
+            -f compose.logs.yml up -d -y dozzle
+
+      - name: Wait for the Dozzle healthcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 60))
+          while true; do
+            if curl -fsS -o /dev/null http://127.0.0.1:9999/healthcheck; then
+              printf 'Dozzle healthcheck returned 200\n'
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              docker compose -p elara-demo \
+                -f "oci://ghcr.io/elara-app/elara-demo:latest" \
+                -f compose.logs.yml logs dozzle || true
+              printf '::error::Dozzle healthcheck did not return 200 within 60s\n'
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Check the layered flow
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPOSE_REF="oci://ghcr.io/elara-app/elara-demo:latest" \
+            bash scripts/flow-check.sh
+
+      - name: Tear down the demo stack
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker compose -p elara-demo \
+            -f "oci://ghcr.io/elara-app/elara-demo:latest" \
+            -f compose.logs.yml down; then
+            printf 'demo stack removed\n'
+          else
+            printf '::warning::could not tear down the demo stack\n'
+          fi
