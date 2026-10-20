@@ -160,17 +160,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ref="ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
-          if docker buildx imagetools inspect --raw "$ref" >/dev/null 2>"$RUNNER_TEMP/existing-tag.err"; then
+          ref="oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}"
+          if docker compose -f "$ref" config --format json >/dev/null 2>"$RUNNER_TEMP/existing-tag.err"; then
             printf 'exists=true\n' >> "$GITHUB_OUTPUT"
             printf 'existing artifact: %s\n' "$ref"
           else
             cat "$RUNNER_TEMP/existing-tag.err" >&2
-            if grep -qiE 'not found|manifest unknown|name unknown|failed to authorize|403 Forbidden' "$RUNNER_TEMP/existing-tag.err"; then
+            if grep -qiE 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/existing-tag.err"; then
               printf 'exists=false\n' >> "$GITHUB_OUTPUT"
               printf 'artifact absent: %s\n' "$ref"
             else
-              echo "::error::could not determine whether $ref exists"
+              echo "::error::$ref may exist but is not anonymously readable; do not publish over it"
               exit 1
             fi
           fi
@@ -381,8 +381,8 @@ jobs:
 
   smoke-sha:
     name: Smoke sha artifact
-    needs: [preflight, publish-sha]
-    if: always() && needs.preflight.result == 'success' && (needs.publish-sha.result == 'success' || needs.publish-sha.result == 'skipped')
+    needs: [preflight, publish-sha, verify-sha]
+    if: always() && needs.preflight.result == 'success' && (needs.publish-sha.result == 'success' || needs.verify-sha.result == 'success')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
