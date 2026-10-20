@@ -4,8 +4,10 @@
 #
 # The check posts one uniquely named inventory item through the gateway,
 # waits for the expected inventory and unit-of-measure log markers, deletes
-# the item, and confirms the seed count is back to two. It never brings the
-# stack up and never prints secrets.
+# the item, and confirms the seed count is back to two. The two inventory
+# markers must carry this run's unique name. If the POST response is lost, the
+# checker looks the item up by that name so the EXIT trap can still delete it.
+# It never brings the stack up and never prints secrets.
 #
 #   COMPOSE_REF=./compose.published.yml bash ./scripts/flow-check.sh
 #   COMPOSE_REF=oci://ghcr.io/elara-app/elara-demo:latest bash ./scripts/flow-check.sh
@@ -30,6 +32,8 @@ RETRIES=40
 RETRY_DELAY=3
 LOG_RETRIES=60
 LOG_RETRY_DELAY=2
+ORPHAN_RETRIES=5
+ORPHAN_RETRY_DELAY=1
 
 die() {
   printf 'flow-check: %s\n' "$*" >&2
@@ -76,14 +80,26 @@ printf 'flow-check: gateway URL %s\n' "$GATEWAY_URL"
 TMP_DIR=$(mktemp -d)
 ITEM_ID=''
 LOGS_FILE="$TMP_DIR/logs.txt"
+LOGS_ERR="$TMP_DIR/logs.err"
 POST_BODY="$TMP_DIR/post.json"
+SEARCH_BODY="$TMP_DIR/search.json"
 MATCHED_FILE="$TMP_DIR/matched.log"
 
 cleanup() {
   if [ -n "${ITEM_ID:-}" ]; then
-    curl -sS -o /dev/null --connect-timeout 3 --max-time 10 \
-      -X DELETE "${GATEWAY_URL}/api/v1/inventory/item/${ITEM_ID}" \
-      >/dev/null 2>&1 || true
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+      code=$(curl -sS -o /dev/null --connect-timeout 3 --max-time 10 \
+        -w '%{http_code}' -X DELETE \
+        "${GATEWAY_URL}/api/v1/inventory/item/${ITEM_ID}" 2>/dev/null) || code=000
+      case "$code" in
+        2[0-9][0-9]|404) break ;;
+      esac
+      if [ "$attempt" -lt 3 ]; then
+        sleep 1
+      fi
+      attempt=$((attempt + 1))
+    done
   fi
   rm -rf "$TMP_DIR" || true
 }
@@ -118,24 +134,77 @@ post_item() {
   return 1
 }
 
+recover_orphan_item() {
+  encoded_name=$(jq -rn --arg name "$item_name" '$name | @uri' 2>/dev/null) || return 1
+  attempt=1
+  while [ "$attempt" -le "$ORPHAN_RETRIES" ]; do
+    if curl -fsS --connect-timeout 3 --max-time 10 \
+      -H 'Accept: application/json' \
+      -o "$SEARCH_BODY" \
+      "$GATEWAY_URL/api/v1/inventory/item/search?name=${encoded_name}&page=0&size=20" \
+      2>/dev/null; then
+      id=$(jq -r --arg name "$item_name" \
+        '[.content[]? | select(.name == $name)][0].id // empty' \
+        "$SEARCH_BODY" 2>/dev/null) || id=''
+      case "$id" in
+        ''|*[!0-9]*) ;;
+        *)
+          ITEM_ID=$id
+          printf 'flow-check: recovered orphaned item %s (id %s) after a lost POST response\n' \
+            "$item_name" "$ITEM_ID" >&2
+          return 0
+          ;;
+      esac
+    fi
+    if [ "$attempt" -lt "$ORPHAN_RETRIES" ]; then
+      sleep "$ORPHAN_RETRY_DELAY"
+    fi
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+marker_present() {
+  marker=$1
+  case "$marker" in
+    '[InventoryItem-controller-create]'|'[InventoryItem-service-save]')
+      # The two inventory markers must belong to this run, not an earlier one.
+      grep -F -- "$marker" "$LOGS_FILE" | grep -F -- "$item_name" >/dev/null
+      ;;
+    *)
+      grep -Fq -- "$marker" "$LOGS_FILE"
+      ;;
+  esac
+}
+
 wait_for_log_markers() {
   attempt=1
+  missing=''
   while [ "$attempt" -le "$LOG_RETRIES" ]; do
-    compose logs --since "$SINCE" --no-log-prefix \
-      inventory-service unit-of-measure-service > "$LOGS_FILE" 2>/dev/null || true
-    missing=''
-    for marker in \
-      '[InventoryItem-controller-create]' \
-      '[InventoryItem-service-save]' \
-      '[Uom-service-existsById]' \
-      '[Uom-controller-getById]' \
-      'insert into inventory_item'
-    do
-      if ! grep -Fq -- "$marker" "$LOGS_FILE"; then
-        missing="$missing $marker"
+    logs_captured=1
+    if ! compose logs --since "$SINCE" --no-log-prefix \
+      inventory-service unit-of-measure-service > "$LOGS_FILE" 2> "$LOGS_ERR"; then
+      logs_captured=0
+      log_error=$(cat "$LOGS_ERR" 2>/dev/null || true)
+      if printf '%s\n' "$log_error" | grep -Eiq 'no such (service|project)|not found'; then
+        die "compose logs failed: ${log_error:-unknown error}"
       fi
-    done
-    [ -z "$missing" ] && return 0
+    fi
+    if [ "$logs_captured" -eq 1 ]; then
+      missing=''
+      for marker in \
+        '[InventoryItem-controller-create]' \
+        '[InventoryItem-service-save]' \
+        '[Uom-service-existsById]' \
+        '[Uom-controller-getById]' \
+        'insert into inventory_item'
+      do
+        if ! marker_present "$marker"; then
+          missing="$missing $marker"
+        fi
+      done
+      [ -z "$missing" ] && return 0
+    fi
     if [ "$attempt" -lt "$LOG_RETRIES" ]; then
       sleep "$LOG_RETRY_DELAY"
     fi
@@ -184,7 +253,12 @@ wait_for_seed_count() {
 # The timestamp is taken immediately before the POST so the log capture cannot
 # include an earlier run that happens to use the same unique item name.
 SINCE=$(date -u +%FT%TZ)
-post_item || die "inventory item POST did not return a 2xx response with a numeric id after $RETRIES attempts"
+if ! post_item; then
+  if recover_orphan_item; then
+    die "inventory item POST did not return a 2xx response with a numeric id after $RETRIES attempts; orphaned item $item_name (id $ITEM_ID) will be removed by the EXIT trap"
+  fi
+  die "inventory item POST did not return a 2xx response with a numeric id after $RETRIES attempts"
+fi
 
 wait_for_log_markers || die "the expected inventory and unit-of-measure log markers did not appear after $LOG_RETRIES attempts"
 
