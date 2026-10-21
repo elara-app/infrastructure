@@ -15,6 +15,14 @@
 
 name: elara
 
+# Shared by every service: bounded json-file logs, same policy as the
+# published compose. Keeps local development from filling the disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # --- Java services (build contexts live in the sibling repos) ---------------
 
@@ -43,6 +51,7 @@ services:
       start_period: 90s
     restart: unless-stopped
     mem_limit: 256M
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -67,6 +76,7 @@ services:
       start_period: 60s
     restart: unless-stopped
     mem_limit: 256M
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -104,6 +114,7 @@ services:
       start_period: 60s
     restart: unless-stopped
     mem_limit: 512M
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -155,6 +166,7 @@ services:
       start_period: 90s
     restart: unless-stopped
     mem_limit: 512M
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -204,6 +216,7 @@ services:
       start_period: 90s
     restart: unless-stopped
     mem_limit: 512M
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -241,6 +254,7 @@ services:
       start_period: 30s
     restart: unless-stopped
     mem_limit: 512M  # tmpfs data is RAM and is charged to this limit
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -274,6 +288,7 @@ services:
       start_period: 30s
     restart: unless-stopped
     mem_limit: 512M  # tmpfs data is RAM and is charged to this limit
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -296,6 +311,7 @@ services:
       start_period: 40s
     restart: unless-stopped
     mem_limit: 256M
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -323,6 +339,7 @@ services:
       start_period: 20s
     restart: unless-stopped
     mem_limit: 512M
+    logging: *default-logging
     networks:
       - elara-net
 
@@ -343,6 +360,7 @@ services:
     volumes:
       - ./scripts:/work/scripts:ro
       - ../centralized-configuration/service-secrets:/secrets:ro
+    logging: *default-logging
     networks:
       - elara-net
     restart: "no"
