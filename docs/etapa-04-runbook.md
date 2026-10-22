@@ -195,7 +195,7 @@ curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/api/v1/inventory
 curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/api/v1/uom/?page"                # 200
 curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/api/v1/uom/status/?page"        # 200
 curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8080/noexiste/"                      # 404
-curl -fsS http://localhost:8080/swagger-ui/index.html | grep -qi 'Swagger UI'                   # Swagger UI page served
+curl -fsS http://localhost:8080/webjars/swagger-ui/index.html | grep -qi 'Swagger UI'          # Swagger UI page served
 docker compose logs api-gateway | grep -cE "503|No available LoadBalancer|Unable to find instance"   # must be 0
 ```
 
