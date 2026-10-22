@@ -238,7 +238,7 @@ container-runtime restarts (daemon restart, host reboot, OOM) do not re-evaluate
 | --- | --- | --- |
 | `8888` | `config-service` | config endpoint `/<app>/<profile>` + `/actuator/health` |
 | `8761` | `discovery-service` | Eureka dashboard + `/eureka/apps` |
-| `8080` | `api-gateway` | the only public entry point (`/api/v1/...`, `/inventory-service/...`) |
+| `8080` | `api-gateway` | the only public entry point (`/api/v1/...`, `/inventory-service/...`, Swagger UI at `/swagger-ui/index.html`) |
 | `5672` | `rabbitmq` | AMQP (dev) |
 | `15672` | `rabbitmq` | management UI/API (dev) |
 | `8200` | `vault` | dev-mode Vault (dev) |
