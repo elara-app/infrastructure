@@ -69,13 +69,14 @@ container already carries the demo records:
 
 | rows | contents |
 | --- | --- |
-| `inventory_item` | `Steel Bolt M10` (uom 1), `Aluminum Sheet 4x8` (uom 2) |
+| `inventory_item` | `Steel Bolt M10` (uom 1), `Aluminum Sheet 4x8` (uom 2), plus 8 warehouse items (uom 1) |
 | `uom_status` | `Active`, `Inactive`, `Deprecated` |
-| `uom` | `Kilogram` (factor 1.000), `Gram` (factor 0.001) |
+| `uom` | `Kilogram` (factor 1.000), `Gram` (0.001), `Pound` (0.454), `Ounce` (0.028), `Tonne` (1000.000) |
 
 The inserts are idempotent (`ON CONFLICT DO NOTHING` plus identity-sequence resync), so
 restarting only the service never duplicates rows. The inventory `base_unit_of_measure_id`
-values 1 and 2 are a deliberate id contract with the UoM seed.
+values 1 and 2 are a deliberate id contract with the UoM seed. UoM ids 3-5 are additional
+units for API tests; the inventory items keep referencing 1/2.
 
 Restart semantics that go with ephemeral data:
 
@@ -238,7 +239,7 @@ container-runtime restarts (daemon restart, host reboot, OOM) do not re-evaluate
 | --- | --- | --- |
 | `8888` | `config-service` | config endpoint `/<app>/<profile>` + `/actuator/health` |
 | `8761` | `discovery-service` | Eureka dashboard + `/eureka/apps` |
-| `8080` | `api-gateway` | the only public entry point (`/api/v1/...`, `/inventory-service/...`) |
+| `8080` | `api-gateway` | the only public entry point (`/api/v1/...`, `/inventory-service/...`, Swagger UI at `/swagger-ui/index.html`) |
 | `5672` | `rabbitmq` | AMQP (dev) |
 | `15672` | `rabbitmq` | management UI/API (dev) |
 | `8200` | `vault` | dev-mode Vault (dev) |
@@ -284,6 +285,77 @@ from `VAULT_DEV_ROOT_TOKEN_ID`, so the YAML placeholder and Boot's relaxed bindi
 never drift into a 403. The vault container keeps its own literal
 `VAULT_ADDR=http://127.0.0.1:8200`, because its healthcheck runs `vault status` inside the
 container and the Vault CLI would otherwise default to `https`.
+
+### Running multiple instances
+
+The gateway and the two business services are stateless and register in Eureka; the gateway
+resolves inventory and unit of measure with `lb://` (Spring Cloud LoadBalancer, round-robin).
+Only those three are Eureka clients; `config-service` and `discovery-service` are outside
+the `lb://` path. `discovery-service` is the single registry — scaling it as-is would create
+an independent registry, not a replica — so it is out of scope here.
+
+- Each replica registers as `${spring.application.name}:${random.uuid}` with
+  `prefer-ip-address: true`, so instances do not overwrite each other in the registry.
+- The gateway targets `lb://inventory-service` and `lb://unit-of-measure-service`; it
+  neither knows nor needs the instance port.
+- The dev seed is idempotent (`ON CONFLICT DO NOTHING`), so a second inventory or unit of
+  measure instance can start against the same database without duplicating rows.
+- No service sets `container_name`, so Compose can create more than one container per
+  service.
+
+**Bare metal / JVM.** `server.port` is `${SERVER_PORT:8081}` (inventory) and
+`${SERVER_PORT:8082}` (unit of measure) in `centralized-configuration`. From `infra/`,
+start a second copy with a different port, or let the OS pick one:
+
+```bash
+cd ../inventory-service && SERVER_PORT=0 java -jar target/inventory-service-*.jar
+```
+
+With `SERVER_PORT=0`, the bound port appears in the startup log and is what Eureka
+registers, so the gateway reaches the new instance. Start the first instance and wait for
+its health endpoint before starting the next: the `dev` profile uses `ddl-auto: update`, and
+concurrent schema updates against the same database are not safe (see the limitation below).
+
+**Docker Compose.** The in-container port is not the blocker: every container has its own
+network namespace, so two replicas can both listen on `8081` (or `8082`). The **host**
+publish is what prevents `--scale` (the `127.0.0.1:8081:8081` entry in "The nine default
+services"), because both replicas would bind the same host port. Drop the publish for the
+replicas with an override file and scale in two steps, waiting for the first replica to be
+healthy before adding the second (see the limitation below):
+
+```yaml
+# scale.override.yml
+services:
+  inventory-service:
+    ports: !reset []
+  unit-of-measure-service:
+    ports: !reset []
+```
+
+```bash
+# 1. Start one replica and wait until it is healthy.
+docker compose -f compose.yml -f scale.override.yml up -d
+
+# 2. Add the second replica; the schema already exists.
+docker compose -f compose.yml -f scale.override.yml up -d --scale inventory-service=2
+```
+
+`!reset` is supported by current Compose releases; the publish workflow pins Compose
+2.40.3. The container healthchecks probe `localhost:8081` (inventory) and `localhost:8082`
+(unit of measure) inside each replica, so they keep working; the gateway also exposes
+`/api/v1/inventory/actuator/health` and `/api/v1/uom/actuator/health` for external checks.
+The per-container probe stays local on purpose: if it depended on the gateway, while the
+gateway waits for the service to be healthy, the startup would deadlock.
+
+**Limitation.** The `dev` profile uses `ddl-auto: update` and runs the SQL seed on every
+start. The seed is idempotent, but Hibernate's schema update is not safe under concurrent
+startup: start one instance, wait for it to be healthy, then start the next. For a
+production-grade multi-instance deployment, replace `ddl-auto: update` with a migration
+tool (Flyway or Liquibase) that applies each schema version once.
+
+The published artifact (`elara-demo:<version>`) ships `compose.published.yml`; the override
+above is a source-checkout capability. The artifact keeps the debug port bindings for the
+single-instance demo.
 
 ### Memory and JVM sizing
 
