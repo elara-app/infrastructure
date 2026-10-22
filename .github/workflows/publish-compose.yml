@@ -235,7 +235,8 @@ jobs:
           if docker buildx imagetools inspect "$ref" >/dev/null 2>"$RUNNER_TEMP/version-tag.err"; then
             printf 'version_exists=true\n' >> "$GITHUB_OUTPUT"
             printf 'version artifact already exists: %s\n' "$ref"
-          elif grep -qiE 'manifest unknown|name unknown' "$RUNNER_TEMP/version-tag.err"; then
+          elif grep -qiE 'manifest unknown|name unknown|not found' "$RUNNER_TEMP/version-tag.err"; then
+            # buildx renders the registry's MANIFEST_UNKNOWN 404 as "not found"
             printf 'version_exists=false\n' >> "$GITHUB_OUTPUT"
             printf 'version artifact absent: %s\n' "$ref"
           else
@@ -364,18 +365,37 @@ jobs:
           set -euo pipefail
           version="$(tr -d '[:space:]' < VERSION)"
           if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::VERSION is not a semantic version: $version"
+            echo "::error::VERSION is not a release version (X.Y.Z): $version"
             exit 1
           fi
+          services=(api-gateway config-service discovery-service inventory-service unit-of-measure-service)
+
+          # What the released sha artifact pins.
+          released="$RUNNER_TEMP/released.json"
+          docker compose -f "oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}" config --format json > "$released"
+          released_config="$(jq -r '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL' "$released")"
+          released_images="$(jq -r '.services | to_entries[] | select(.value.image | startswith("ghcr.io/")) | "\(.key)=\(.value.image | split("@")[1])"' "$released" | sort)"
+
+          # What this publish would pin.
+          candidate_images="$(for service in "${services[@]}"; do
+            digest="$(docker buildx imagetools inspect "ghcr.io/elara-app/${service}:latest" --format '{{.Manifest.Digest}}')"
+            printf '%s=%s\n' "$service" "$digest"
+          done | sort)"
+
+          if [ "$released_config" != "$CONFIG_SHA" ] || [ "$released_images" != "$candidate_images" ]; then
+            echo "::error::the version artifact would not match the released sha artifact; nothing was published"
+            echo "::error::config revision: released ${released_config}, current ${CONFIG_SHA}"
+            diff <(printf '%s\n' "$released_images") <(printf '%s\n' "$candidate_images") || true
+            exit 1
+          fi
+
           docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
             publish -y --resolve-image-digests "ghcr.io/elara-app/elara-demo:${version}"
-          rendered_digest() {
-            docker compose -f "$1" config --format json | jq -S . | sha256sum | awk '{print $1}'
-          }
-          expected="$(rendered_digest "oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}")"
-          actual="$(rendered_digest "oci://ghcr.io/elara-app/elara-demo:${version}")"
+
+          expected="$(jq -S . "$released" | sha256sum | awk '{print $1}')"
+          actual="$(docker compose -f "oci://ghcr.io/elara-app/elara-demo:${version}" config --format json | jq -S . | sha256sum | awk '{print $1}')"
           if [ "$expected" != "$actual" ]; then
-            echo "::error::the version artifact renders differently from the sha artifact (${actual} != ${expected}); remove the version tag before retrying"
+            echo "::error::the published version artifact renders differently (${actual} != ${expected}); remove the version tag before retrying"
             exit 1
           fi
           printf 'version artifact published and verified: %s\n' "$version"
