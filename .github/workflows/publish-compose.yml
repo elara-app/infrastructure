@@ -368,22 +368,35 @@ jobs:
             echo "::error::VERSION is not a release version (X.Y.Z): $version"
             exit 1
           fi
-          services=(api-gateway config-service discovery-service inventory-service unit-of-measure-service)
-
           # What the released sha artifact pins.
           released="$RUNNER_TEMP/released.json"
           docker compose -f "oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}" config --format json > "$released"
           released_config="$(jq -r '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL' "$released")"
-          released_images="$(jq -r '.services | to_entries[] | select(.value.image | startswith("ghcr.io/")) | "\(.key)=\(.value.image | split("@")[1])"' "$released" | sort)"
+          released_images="$(jq -r '.services | to_entries[] | "\(.key)=\(.value.image | (if contains("@") then split("@")[1] else . end))"' "$released" | sort)"
 
-          # What this publish would pin.
-          candidate_images="$(for service in "${services[@]}"; do
-            digest="$(docker buildx imagetools inspect "ghcr.io/elara-app/${service}:latest" --format '{{.Manifest.Digest}}')"
-            printf '%s=%s\n' "$service" "$digest"
-          done | sort)"
+          # What this publish would pin: every image of the released artifact,
+          # resolved by its own reference.
+          candidate="$RUNNER_TEMP/candidate-images.txt"
+          : > "$candidate"
+          while IFS=$'\t' read -r service image; do
+            digest=""
+            for _ in 1 2 3; do
+              if digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}' 2>"$RUNNER_TEMP/inspect.err")"; then
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$digest" ]; then
+              cat "$RUNNER_TEMP/inspect.err" >&2
+              echo "::error::could not inspect $image after three attempts to compare it with the released artifact"
+              exit 1
+            fi
+            printf '%s=%s\n' "$service" "$digest" >> "$candidate"
+          done < <(jq -r '.services | to_entries[] | [.key, (.value.image | split("@")[0])] | @tsv' "$released")
+          candidate_images="$(sort "$candidate")"
 
           if [ "$released_config" != "$CONFIG_SHA" ] || [ "$released_images" != "$candidate_images" ]; then
-            echo "::error::the version artifact would not match the released sha artifact; nothing was published"
+            echo "::error::the version artifact would not match the released sha artifact; the version tag was not published"
             echo "::error::config revision: released ${released_config}, current ${CONFIG_SHA}"
             diff <(printf '%s\n' "$released_images") <(printf '%s\n' "$candidate_images") || true
             exit 1
