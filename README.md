@@ -69,13 +69,14 @@ container already carries the demo records:
 
 | rows | contents |
 | --- | --- |
-| `inventory_item` | `Steel Bolt M10` (uom 1), `Aluminum Sheet 4x8` (uom 2) |
+| `inventory_item` | `Steel Bolt M10` (uom 1), `Aluminum Sheet 4x8` (uom 2), plus 8 warehouse items (uom 1) |
 | `uom_status` | `Active`, `Inactive`, `Deprecated` |
-| `uom` | `Kilogram` (factor 1.000), `Gram` (factor 0.001) |
+| `uom` | `Kilogram` (factor 1.000), `Gram` (0.001), `Pound` (0.454), `Ounce` (0.028), `Tonne` (1000.000) |
 
 The inserts are idempotent (`ON CONFLICT DO NOTHING` plus identity-sequence resync), so
 restarting only the service never duplicates rows. The inventory `base_unit_of_measure_id`
-values 1 and 2 are a deliberate id contract with the UoM seed.
+values 1 and 2 are a deliberate id contract with the UoM seed. UoM ids 3-5 are additional
+units for API tests; the inventory items keep referencing 1/2.
 
 Restart semantics that go with ephemeral data:
 

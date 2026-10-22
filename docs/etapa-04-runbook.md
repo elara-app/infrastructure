@@ -95,7 +95,7 @@ docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -t
 docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom_status" # 3
 ```
 
-OK: 2× `accepting connections` + 2× `SELECT 1` → `1` + seed counts `2/2/3`
+OK: 2× `accepting connections` + 2× `SELECT 1` → `1` + seed counts `10/5/3`
 (inventory item / uom / status); `5672 OPEN`;
 overview 200 with a version; `Sealed: false`; five health 200s. FAIL → R3 per component.
 
@@ -205,11 +205,11 @@ path keeps the service segment and 404s; ETAPA-01 ruling + verification).
 
 ## E9 — Acta (one FAIL = FAIL)
 
-Build 5× (E1) + all `healthy` (`compose ps`) + PG 2× `SELECT 1` + seed counts `2/2/3` +
+Build 5× (E1) + all `healthy` (`compose ps`) + PG 2× `SELECT 1` + seed counts `10/5/3` +
 `5672 OPEN` + overview 200 + `Sealed: false` + 2× `kv get` (4 keys each) + config health 200 +
 3× config `200` + Eureka 3 applications UP + health 200 on 8081/8082 (debug bindings) +
-direct/locator/explicit gateway matrix above + seed API rows (2 inventory items referencing
-uom 1/2, 2 uoms, 3 statuses) + zero 503 + `docker compose logs` clean of `ERROR` for the
+direct/locator/explicit gateway matrix above + seed API rows (10 inventory items referencing
+uom 1/2, 5 uoms, 3 statuses) + zero 503 + `docker compose logs` clean of `ERROR` for the
 five services.
 
 ## Restart semantics (ephemeral data)
@@ -263,25 +263,25 @@ for i in $(seq 1 60); do
 done
 curl -fsS http://localhost:8888/inventory-service/dev >/dev/null && echo "config OK"
 curl -fsS -H "Accept: application/json" http://localhost:8761/eureka/apps | jq -e '[.applications.application[].name] | sort == ["API-GATEWAY","INVENTORY-SERVICE","UNIT-OF-MEASURE-SERVICE"]' >/dev/null && echo "eureka OK"
-curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2' >/dev/null && echo "seed inventory OK"
-curl -fsS "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc"            | jq -e '.page.totalElements == 2' >/dev/null && echo "seed uom OK"
+curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 10' >/dev/null && echo "seed inventory OK"
+curl -fsS "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc"            | jq -e '.page.totalElements == 5' >/dev/null && echo "seed uom OK"
 curl -fsS "http://localhost:8080/api/v1/uom/status/?page=0&size=20"                 | jq -e '.page.totalElements == 3' >/dev/null && echo "seed statuses OK"
 # Ephemerality proof: insert a probe row, restart the Postgres pair (cascades to the
 # services and the gateway) and confirm the probe is gone while the seed is back.
 probe_ok=0
 curl -fsS -X POST http://localhost:8080/api/v1/inventory/item/ -H 'Content-Type: application/json' \
   -d '{"name":"E10 Ephemerality Probe","description":"temporary","baseUnitOfMeasureId":1,"standardCost":1.00,"unitPerPurchaseUom":1.00,"reorderPointQuantity":1.00}' >/dev/null
-curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 3' >/dev/null \
-  && probe_ok=1 && echo "probe inserted (3 items)" \
+curl -fsS "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 11' >/dev/null \
+  && probe_ok=1 && echo "probe inserted (11 items)" \
   || echo "FAIL: probe not inserted - ephemerality proof is void"
 sudo docker compose restart postgres-inventory postgres-uom
 for i in $(seq 1 24); do
   if [ "$probe_ok" = 1 ] \
     && curl -fsS --max-time 10 http://localhost:8080/actuator/health >/dev/null 2>&1 \
-    && curl -fsS --max-time 10 "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2 and ([.content[].name] | index("E10 Ephemerality Probe") == null)' >/dev/null 2>&1 \
-    && curl -fsS --max-time 10 "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 2' >/dev/null 2>&1 \
+    && curl -fsS --max-time 10 "http://localhost:8080/api/v1/inventory/item/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 10 and ([.content[].name] | index("E10 Ephemerality Probe") == null)' >/dev/null 2>&1 \
+    && curl -fsS --max-time 10 "http://localhost:8080/api/v1/uom/?page=0&size=20&sort=id,asc" | jq -e '.page.totalElements == 5' >/dev/null 2>&1 \
     && curl -fsS --max-time 10 "http://localhost:8080/api/v1/uom/status/?page=0&size=20" | jq -e '.page.totalElements == 3' >/dev/null 2>&1; then
-    echo "probe gone, seed back to 2/2/3"; break
+    echo "probe gone, seed back to 10/5/3"; break
   fi
   if [ "$i" = 24 ]; then echo "FAIL: not recovered in time or probe survived"; fi
   sleep 5
@@ -293,7 +293,7 @@ done
 # and retry the `up vault-loader` above — the loader is idempotent.
 ```
 
-OK: re-up reaches the same state — seed counts `2/2/3` with no manual SQL — but ONLY AFTER
+OK: re-up reaches the same state — seed counts `10/5/3` with no manual SQL — but ONLY AFTER
 the Vault one-shot: Vault dev mode is in-memory, so any down/up leaves it empty,
 `depends_on` does not wait for the secrets, and without the re-run E6 fails (403/404) and
 the business services boot with missing secrets (the re-up itself takes ~2–4 min: config
