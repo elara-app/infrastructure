@@ -4,7 +4,7 @@
 #
 # The check posts one uniquely named inventory item through the gateway,
 # waits for the expected inventory and unit-of-measure log markers, deletes
-# the item, and confirms the seed count is back to two. The two inventory
+# the item, and confirms the seed count is back to ten. The two inventory
 # markers must carry this run's unique name. If the POST response is lost, the
 # checker looks the item up by that name so the EXIT trap can still delete it.
 # It never brings the stack up and never prints secrets.
@@ -239,7 +239,7 @@ wait_for_seed_count() {
       "$GATEWAY_URL/api/v1/inventory/item/?page=0&size=20&sort=id,asc" 2>/dev/null) \
       || response=''
     if [ -n "$response" ] \
-       && printf '%s' "$response" | jq -e '.page.totalElements == 2' >/dev/null 2>&1; then
+       && printf '%s' "$response" | jq -e '.page.totalElements == 10' >/dev/null 2>&1; then
       return 0
     fi
     if [ "$attempt" -lt "$RETRIES" ]; then
@@ -277,6 +277,6 @@ done < "$MATCHED_FILE"
 delete_item || die "could not delete inventory item $ITEM_ID"
 ITEM_ID=''
 
-wait_for_seed_count || die "inventory count did not return to 2 after $RETRIES attempts"
-printf 'flow-check: inventory seed count restored to 2\n'
+wait_for_seed_count || die "inventory count did not return to 10 after $RETRIES attempts"
+printf 'flow-check: inventory seed count restored to 10\n'
 printf 'FLOW OK\n'

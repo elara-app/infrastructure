@@ -140,10 +140,10 @@ wait_for_json "Eureka registrations" "$EUREKA_APPS" '
 
 wait_for_json "inventory seed count" \
   "$GATEWAY_URL/api/v1/inventory/item/?page=0&size=20&sort=id,asc" \
-  '.page.totalElements == 2'
+  '.page.totalElements == 10'
 wait_for_json "unit-of-measure seed count" \
   "$GATEWAY_URL/api/v1/uom/?page=0&size=20&sort=id,asc" \
-  '.page.totalElements == 2'
+  '.page.totalElements == 5'
 wait_for_json "unit-of-measure status seed count" \
   "$GATEWAY_URL/api/v1/uom/status/?page=0&size=20" \
   '.page.totalElements == 3'
