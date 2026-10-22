@@ -70,6 +70,7 @@ jobs:
       CONFIG_SHA: ${{ needs.prepare.outputs.config_sha }}
     outputs:
       exists: ${{ steps.existing.outputs.exists }}
+      version_exists: ${{ steps.version.outputs.version_exists }}
       short_sha: ${{ needs.prepare.outputs.short_sha }}
       config_sha: ${{ needs.prepare.outputs.config_sha }}
       is_current: ${{ needs.prepare.outputs.is_current }}
@@ -215,10 +216,40 @@ jobs:
               ;;
           esac
 
+      - name: Check whether the version artifact already exists
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f VERSION ]; then
+            printf 'version_exists=true\n' >> "$GITHUB_OUTPUT"
+            echo "::warning::no VERSION file; the version tag is not published"
+            exit 0
+          fi
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION is not a semantic version: $version"
+            exit 1
+          fi
+          ref="ghcr.io/elara-app/elara-demo:${version}"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>"$RUNNER_TEMP/version-tag.err"; then
+            printf 'version_exists=true\n' >> "$GITHUB_OUTPUT"
+            printf 'version artifact already exists: %s\n' "$ref"
+          elif grep -qiF "$ref: not found" "$RUNNER_TEMP/version-tag.err" \
+            || grep -qiE 'manifest unknown|name unknown' "$RUNNER_TEMP/version-tag.err"; then
+            # buildx renders the registry's MANIFEST_UNKNOWN 404 as "<ref>: not found"
+            printf 'version_exists=false\n' >> "$GITHUB_OUTPUT"
+            printf 'version artifact absent: %s\n' "$ref"
+          else
+            cat "$RUNNER_TEMP/version-tag.err" >&2
+            echo "::error::could not determine whether $ref exists"
+            exit 1
+          fi
+
   publish-sha:
     name: Publish sha artifact
     needs: preflight
-    if: needs.preflight.outputs.exists != 'true'
+    if: needs.preflight.outputs.exists != 'true' || needs.preflight.outputs.version_exists != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -300,6 +331,7 @@ jobs:
           printf 'config pin verified: %s\n' "$rendered"
 
       - name: Publish the sha artifact
+        if: needs.preflight.outputs.exists != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -326,6 +358,61 @@ jobs:
           docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
             publish -y --resolve-image-digests "$ref"
           record_digest sha "$ref"
+
+      - name: Publish the version artifact
+        if: needs.preflight.outputs.version_exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION is not a release version (X.Y.Z): $version"
+            exit 1
+          fi
+          # What the released sha artifact pins.
+          released="$RUNNER_TEMP/released.json"
+          docker compose -f "oci://ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}" config --format json > "$released"
+          released_config="$(jq -r '.services["config-service"].environment.SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL' "$released")"
+          released_images="$(jq -r '.services | to_entries[] | "\(.key)=\(.value.image | (if contains("@") then split("@")[1] else . end))"' "$released" | sort)"
+
+          # What this publish would pin: every image of the released artifact,
+          # resolved by its own reference.
+          candidate="$RUNNER_TEMP/candidate-images.txt"
+          : > "$candidate"
+          while IFS=$'\t' read -r service image; do
+            digest=""
+            for _ in 1 2 3; do
+              if digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}' 2>"$RUNNER_TEMP/inspect.err")"; then
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$digest" ]; then
+              cat "$RUNNER_TEMP/inspect.err" >&2
+              echo "::error::could not inspect $image after three attempts to compare it with the released artifact"
+              exit 1
+            fi
+            printf '%s=%s\n' "$service" "$digest" >> "$candidate"
+          done < <(jq -r '.services | to_entries[] | [.key, (.value.image | split("@")[0])] | @tsv' "$released")
+          candidate_images="$(sort "$candidate")"
+
+          if [ "$released_config" != "$CONFIG_SHA" ] || [ "$released_images" != "$candidate_images" ]; then
+            echo "::error::the version artifact would not match the released sha artifact; the version tag was not published"
+            echo "::error::config revision: released ${released_config}, current ${CONFIG_SHA}"
+            diff <(printf '%s\n' "$released_images") <(printf '%s\n' "$candidate_images") || true
+            exit 1
+          fi
+
+          docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
+            publish -y --resolve-image-digests "ghcr.io/elara-app/elara-demo:${version}"
+
+          expected="$(jq -S . "$released" | sha256sum | awk '{print $1}')"
+          actual="$(docker compose -f "oci://ghcr.io/elara-app/elara-demo:${version}" config --format json | jq -S . | sha256sum | awk '{print $1}')"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::the published version artifact renders differently (${actual} != ${expected}); remove the version tag before retrying"
+            exit 1
+          fi
+          printf 'version artifact published and verified: %s\n' "$version"
 
   verify-sha:
     name: Verify sha artifact
