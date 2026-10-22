@@ -90,8 +90,8 @@ for p in 8888 8761 8080; do curl -sf "http://localhost:$p/actuator/health" >/dev
 curl -sf http://localhost:8081/actuator/health >/dev/null && echo "8081 health 200"   # debug binding
 curl -sf http://localhost:8082/actuator/health >/dev/null && echo "8082 health 200"   # debug binding
 # Startup seed (dev profile): tables + demo rows exist with no manual SQL
-docker compose exec postgres-inventory psql -U postgres -d inventory_db -tAc "SELECT count(*) FROM inventory_item"    # 2
-docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom"        # 2
+docker compose exec postgres-inventory psql -U postgres -d inventory_db -tAc "SELECT count(*) FROM inventory_item"    # 10
+docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom"        # 5
 docker compose exec postgres-uom       psql -U postgres -d unit_of_measure_db -tAc "SELECT count(*) FROM uom_status" # 3
 ```
 
