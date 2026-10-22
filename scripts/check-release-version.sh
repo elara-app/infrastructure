@@ -18,6 +18,11 @@ ORG="${ORG:-elara-app}"
 SERVICES=(api-gateway config-service discovery-service inventory-service unit-of-measure-service)
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ ! -f "$repo_root/VERSION" ]; then
+  printf 'check-release-version: no VERSION file in %s\n' "$repo_root" >&2
+  exit 1
+fi
 version="$(tr -d '[:space:]' < "$repo_root/VERSION")"
 
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -29,7 +34,8 @@ printf 'artifact version: %s (services read from %s)\n' "$version" "$REF"
 
 failed=0
 for service in "${SERVICES[@]}"; do
-  if ! pom="$(curl -fsSL --retry 3 "https://raw.githubusercontent.com/${ORG}/${service}/${REF}/pom.xml")"; then
+  if ! pom="$(curl -fsSL --retry 3 --retry-all-errors \
+      "https://raw.githubusercontent.com/${ORG}/${service}/${REF}/pom.xml" 2>/dev/null)"; then
     printf '  %-28s could not read the pom at %s\n' "$service" "$REF" >&2
     failed=1
     continue
