@@ -70,6 +70,7 @@ jobs:
       CONFIG_SHA: ${{ needs.prepare.outputs.config_sha }}
     outputs:
       exists: ${{ steps.existing.outputs.exists }}
+      version_exists: ${{ steps.version.outputs.version_exists }}
       short_sha: ${{ needs.prepare.outputs.short_sha }}
       config_sha: ${{ needs.prepare.outputs.config_sha }}
       is_current: ${{ needs.prepare.outputs.is_current }}
@@ -215,10 +216,38 @@ jobs:
               ;;
           esac
 
+      - name: Check whether the version artifact already exists
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f VERSION ]; then
+            printf 'version_exists=true\n' >> "$GITHUB_OUTPUT"
+            printf 'no VERSION file; there is no version tag to publish\n'
+            exit 0
+          fi
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION is not a semantic version: $version"
+            exit 1
+          fi
+          ref="ghcr.io/elara-app/elara-demo:${version}"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>"$RUNNER_TEMP/version-tag.err"; then
+            printf 'version_exists=true\n' >> "$GITHUB_OUTPUT"
+            printf 'version artifact already exists: %s\n' "$ref"
+          elif grep -qiE 'manifest unknown|name unknown|not found' "$RUNNER_TEMP/version-tag.err"; then
+            printf 'version_exists=false\n' >> "$GITHUB_OUTPUT"
+            printf 'version artifact absent: %s\n' "$ref"
+          else
+            cat "$RUNNER_TEMP/version-tag.err" >&2
+            echo "::error::could not determine whether $ref exists"
+            exit 1
+          fi
+
   publish-sha:
     name: Publish sha artifact
     needs: preflight
-    if: needs.preflight.outputs.exists != 'true'
+    if: needs.preflight.outputs.exists != 'true' || needs.preflight.outputs.version_exists != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -300,6 +329,7 @@ jobs:
           printf 'config pin verified: %s\n' "$rendered"
 
       - name: Publish the sha artifact
+        if: needs.preflight.outputs.exists != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -328,11 +358,12 @@ jobs:
           record_digest sha "$ref"
 
       - name: Publish the version artifact
+        if: needs.preflight.outputs.version_exists != 'true'
         shell: bash
         run: |
           set -euo pipefail
           if [ ! -f VERSION ]; then
-            printf 'no VERSION file; skipping the version tag\n'
+            echo "::warning::no VERSION file; skipping the version tag"
             exit 0
           fi
           version="$(tr -d '[:space:]' < VERSION)"
@@ -340,19 +371,17 @@ jobs:
             echo "::error::VERSION is not a semantic version: $version"
             exit 1
           fi
-          ref="oci://ghcr.io/elara-app/elara-demo:${version}"
-          if docker compose -f "$ref" config --format json >/dev/null 2>"$RUNNER_TEMP/version-tag.err"; then
-            printf 'version artifact already exists: %s (left immutable)\n' "$ref"
-            exit 0
-          fi
-          if ! grep -qiE 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/version-tag.err"; then
-            cat "$RUNNER_TEMP/version-tag.err" >&2
-            echo "::error::$ref may exist but is not readable; do not publish over it"
-            exit 1
-          fi
           docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
             publish -y --resolve-image-digests "ghcr.io/elara-app/elara-demo:${version}"
-          printf 'version artifact published: %s\n' "$version"
+          expected=$(docker buildx imagetools inspect --raw \
+            "ghcr.io/elara-app/elara-demo:sha-${SHORT_SHA}" | sha256sum | awk '{print $1}')
+          actual=$(docker buildx imagetools inspect --raw \
+            "ghcr.io/elara-app/elara-demo:${version}" | sha256sum | awk '{print $1}')
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::version artifact digest ${actual} does not match the sha artifact ${expected}"
+            exit 1
+          fi
+          printf 'version artifact published and verified: %s\n' "$version"
 
   verify-sha:
     name: Verify sha artifact
