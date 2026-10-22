@@ -327,6 +327,33 @@ jobs:
             publish -y --resolve-image-digests "$ref"
           record_digest sha "$ref"
 
+      - name: Publish the version artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f VERSION ]; then
+            printf 'no VERSION file; skipping the version tag\n'
+            exit 0
+          fi
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION is not a semantic version: $version"
+            exit 1
+          fi
+          ref="oci://ghcr.io/elara-app/elara-demo:${version}"
+          if docker compose -f "$ref" config --format json >/dev/null 2>"$RUNNER_TEMP/version-tag.err"; then
+            printf 'version artifact already exists: %s (left immutable)\n' "$ref"
+            exit 0
+          fi
+          if ! grep -qiE 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/version-tag.err"; then
+            cat "$RUNNER_TEMP/version-tag.err" >&2
+            echo "::error::$ref may exist but is not readable; do not publish over it"
+            exit 1
+          fi
+          docker compose -f compose.published.yml -f "$RUNNER_TEMP/config-pin.yml" \
+            publish -y --resolve-image-digests "ghcr.io/elara-app/elara-demo:${version}"
+          printf 'version artifact published: %s\n' "$version"
+
   verify-sha:
     name: Verify sha artifact
     needs: [preflight, publish-sha]
