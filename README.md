@@ -287,36 +287,40 @@ container and the Vault CLI would otherwise default to `https`.
 
 ### Running multiple instances
 
-The five services are stateless and register in Eureka; the gateway resolves them with
-`lb://` (Spring Cloud LoadBalancer, round-robin). Nothing in the code fixes a service to a
-single instance:
+The gateway and the two business services are stateless and register in Eureka; the gateway
+resolves inventory and unit of measure with `lb://` (Spring Cloud LoadBalancer, round-robin).
+Only those three are Eureka clients; `config-service` and `discovery-service` are outside
+the `lb://` path. `discovery-service` is the single registry — scaling it as-is would create
+an independent registry, not a replica — so it is out of scope here.
 
-- Each instance registers as `${spring.application.name}:${random.uuid}` with
-  `prefer-ip-address: true`, so replicas do not overwrite each other in the registry.
-- The gateway targets `lb://<service>`; it neither knows nor needs the instance port.
-- The dev seed is idempotent (`ON CONFLICT DO NOTHING`), so a second instance can start
-  against the same database without duplicating rows.
+- Each replica registers as `${spring.application.name}:${random.uuid}` with
+  `prefer-ip-address: true`, so instances do not overwrite each other in the registry.
+- The gateway targets `lb://inventory-service` and `lb://unit-of-measure-service`; it
+  neither knows nor needs the instance port.
+- The dev seed is idempotent (`ON CONFLICT DO NOTHING`), so a second inventory or unit of
+  measure instance can start against the same database without duplicating rows.
 - No service sets `container_name`, so Compose can create more than one container per
   service.
 
 **Bare metal / JVM.** `server.port` is `${SERVER_PORT:8081}` (inventory) and
-`${SERVER_PORT:8082}` (unit of measure) in `centralized-configuration`. Start a second copy
-with a different port, or let the OS pick one:
+`${SERVER_PORT:8082}` (unit of measure) in `centralized-configuration`. From `infra/`,
+start a second copy with a different port, or let the OS pick one:
 
 ```bash
-SERVER_PORT=0 java -jar target/inventory-service-*.jar
+cd ../inventory-service && SERVER_PORT=0 java -jar target/inventory-service-*.jar
 ```
 
-Spring Cloud registers the port the server actually bound, so the gateway reaches the new
-instance through Eureka. Start the first instance and wait for its health endpoint before
-starting the next: the `dev` profile uses `ddl-auto: update`, and concurrent schema updates
-against the same database are not safe (see the limitation below).
+With `SERVER_PORT=0`, the bound port appears in the startup log and is what Eureka
+registers, so the gateway reaches the new instance. Start the first instance and wait for
+its health endpoint before starting the next: the `dev` profile uses `ddl-auto: update`, and
+concurrent schema updates against the same database are not safe (see the limitation below).
 
 **Docker Compose.** The in-container port is not the blocker: every container has its own
-network namespace, so two replicas can both listen on `8081`. The **host** publish is what
-prevents `--scale` (`127.0.0.1:8081:8081` in the "Published ports" table), because both
-replicas would bind the same host port. Drop the publish for the replicas with an override
-file and scale:
+network namespace, so two replicas can both listen on `8081` (or `8082`). The **host**
+publish is what prevents `--scale` (the `127.0.0.1:8081:8081` entry in "The nine default
+services"), because both replicas would bind the same host port. Drop the publish for the
+replicas with an override file and scale in two steps, waiting for the first replica to be
+healthy before adding the second (see the limitation below):
 
 ```yaml
 # scale.override.yml
@@ -328,14 +332,19 @@ services:
 ```
 
 ```bash
+# 1. Start one replica and wait until it is healthy.
+docker compose -f compose.yml -f scale.override.yml up -d
+
+# 2. Add the second replica; the schema already exists.
 docker compose -f compose.yml -f scale.override.yml up -d --scale inventory-service=2
 ```
 
-`!reset` needs Compose 2.24 or newer (this repository requires 2.40.3). The container
-healthcheck probes `localhost:8081` inside each replica, so it keeps working; the gateway
-also exposes `/api/v1/<service>/actuator/health` for external checks. The per-container
-probe stays local on purpose: if it depended on the gateway, while the gateway waits for
-the service to be healthy, the startup would deadlock.
+`!reset` is supported by current Compose releases; the publish workflow pins Compose
+2.40.3. The container healthchecks probe `localhost:8081` (inventory) and `localhost:8082`
+(unit of measure) inside each replica, so they keep working; the gateway also exposes
+`/api/v1/inventory/actuator/health` and `/api/v1/uom/actuator/health` for external checks.
+The per-container probe stays local on purpose: if it depended on the gateway, while the
+gateway waits for the service to be healthy, the startup would deadlock.
 
 **Limitation.** The `dev` profile uses `ddl-auto: update` and runs the SQL seed on every
 start. The seed is idempotent, but Hibernate's schema update is not safe under concurrent
