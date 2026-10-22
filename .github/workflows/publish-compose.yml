@@ -235,8 +235,9 @@ jobs:
           if docker buildx imagetools inspect "$ref" >/dev/null 2>"$RUNNER_TEMP/version-tag.err"; then
             printf 'version_exists=true\n' >> "$GITHUB_OUTPUT"
             printf 'version artifact already exists: %s\n' "$ref"
-          elif grep -qiE 'manifest unknown|name unknown|not found' "$RUNNER_TEMP/version-tag.err"; then
-            # buildx renders the registry's MANIFEST_UNKNOWN 404 as "not found"
+          elif grep -qiF "$ref: not found" "$RUNNER_TEMP/version-tag.err" \
+            || grep -qiE 'manifest unknown|name unknown' "$RUNNER_TEMP/version-tag.err"; then
+            # buildx renders the registry's MANIFEST_UNKNOWN 404 as "<ref>: not found"
             printf 'version_exists=false\n' >> "$GITHUB_OUTPUT"
             printf 'version artifact absent: %s\n' "$ref"
           else
