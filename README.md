@@ -1,400 +1,158 @@
-# Elara Local Infrastructure
+# Elara infrastructure
 
-Local orchestration repo (no application code): Postgres multi-database bootstrap, the
-idempotent Vault secret loader, `compose.yml` for the whole default 9-service stack, and the
-environment contract that compose wires into the containers.
+`infra` owns the local orchestration of the Elara platform: the source stack in `compose.yml`, the pull-only published demo stack in `compose.published.yml`, the Vault bootstrap (loader image and `scripts/setup-vault.sh`), the multi-database Postgres init script, the verification scripts under `scripts/` and the GitHub Actions workflows that publish and smoke the demo artifact. It contains no application code: in the source stack the five Java services are built from their sibling repositories, and their shared non-secret configuration lives in `centralized-configuration`. The published stack is a demo, not a production deployment.
 
-See `../docs/ETAPA-02-infra-secretos.md` for the plan and `../docs/ETAPA-03-contenerizacion.md`
-for the containerisation stage that consumes these files. Both are historical stage documents
-kept in the untracked `../docs/` directory of the workspace (the workspace root is not a git
-repository), so they are not versioned with this repo.
+## At a glance
 
-## Layout
+| Fact | Value |
+|---|---|
+| Compose projects | `elara` (source, 9 default services) and `elara-demo` (published, 10 services) |
+| Services | `config-service` (8888), `discovery-service` (8761), `api-gateway` (8080), `inventory-service` (8081), `unit-of-measure-service` (8082), `postgres-inventory`, `postgres-uom`, `rabbitmq` (5672/15672), `vault` (8200), `vault-loader` (one-shot) |
+| Pinned images | `postgres:16.15-alpine`, `rabbitmq:3.13.7-management-alpine`, `hashicorp/vault:1.16.3` |
+| Network | one user-defined bridge `elara-net`; no top-level volumes, configs or secrets |
+| State | ephemeral on purpose: Postgres PGDATA is a 128 MiB tmpfs; Vault runs in dev mode with in-memory storage |
+| Seeded data | 10 inventory items, 5 units of measure, 3 UOM statuses |
+| Published artifact | `oci://ghcr.io/elara-app/elara-demo:latest` (also `:sha-<7>` and `:1.3.1`) |
 
-| Path | Purpose |
-| --- | --- |
-| `postgres/init-multiple-dbs.sh` | Creates every database the services need, idempotently. |
-| `scripts/setup-vault.sh` | Loads `service-secrets/*.json` into Vault (KV v2), idempotently. |
-| `vault-loader/Dockerfile` | One-shot Vault bootstrap image (vault 1.16 CLI + bash/jq/base64). |
-| `compose.yml` | The default 9-service stack on `elara-net` (5 Java builds + infra images). |
+## Responsibilities and boundaries
 
-## Postgres bootstrap (`postgres/init-multiple-dbs.sh`)
+`infra` owns:
 
-The official `postgres` image only creates `POSTGRES_DB`. This script runs during the
-image's init phase (mount it into `/docker-entrypoint-initdb.d/`, which keeps the `+x`
-bit that is committed) and creates each database in `POSTGRES_MULTIPLE_DATABASES` that
-does not exist yet, connecting to `POSTGRES_DB` as `POSTGRES_USER` with
-`-v ON_ERROR_STOP=1` and a guarded `CREATE DATABASE ... WHERE NOT EXISTS`.
+- Both Compose stacks: service inventory, host ports, healthchecks, dependency conditions, restart policies and memory limits.
+- The Vault bootstrap: `vault-loader/Dockerfile`, `scripts/setup-vault.sh`, the source `vault-loader` service and the published inline loader.
+- `postgres/init-multiple-dbs.sh`, the source-only multi-database bootstrap.
+- The published demo artifact and the publish/smoke workflows in `.github/workflows/`.
+- The verification scripts: `scripts/smoke-test.sh`, `scripts/flow-check.sh`, `scripts/check-release-version.sh`.
 
-```bash
-mount: ./postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init-multiple-dbs.sh:ro
-env:    POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=inventory_db
-        POSTGRES_MULTIPLE_DATABASES=inventory_db,unit_of_measure_db
-```
+`infra` does not own:
 
-Re-runs are safe: an existing database is never recreated, so the log is identical on a
-second pass. The script now runs on **every** container start, because the Postgres data
-directory is a tmpfs that begins empty (see "Ephemeral data directory" below).
-Names are comma separated, whitespace tolerant
-(`POSTGRES_MULTIPLE_DATABASES="a , b"` creates `a` and `b`), and only plain identifiers
-are accepted — anything else aborts before the SQL is built. If `POSTGRES_DB` is unset the
-official image creates a database named after `POSTGRES_USER` instead, so always set it.
-`compose.yml` mounts the script into `/docker-entrypoint-initdb.d/` of **both** Postgres
-containers, so each of them creates the second database itself.
+- Application code, API behavior, Spring profiles or seed SQL; each service repository owns them.
+- Shared non-secret configuration, the profile matrix and the dev-only secret JSON files; `centralized-configuration` owns them.
+- The gateway route table; `centralized-configuration/api-gateway-dev.yml` owns it.
 
-### Ephemeral data directory
+## Runtime architecture
 
-Both Postgres containers keep `/var/lib/postgresql/data` on a 128 MiB tmpfs instead of named
-volumes, on purpose: data does not survive a container stop, restart, `down` or host reboot,
-so every start re-runs `initdb` and the init script. The `size` is a hard cap — WAL and
-temporary files live inside it, so a bulk load can hit `ENOSPC` — and tmpfs pages are RAM
-charged to the container `mem_limit` (they may also be swapped).
+Two stacks describe the same platform for different consumers. `compose.yml` is the source-development stack; `compose.published.yml` is the consumer/demo stack behind the OCI artifact.
 
-The mount applies when the container is **recreated**: use `docker compose up -d` after this
-file changes; `docker compose restart` does not pick up compose-file changes. Machines
-upgrading from the previous persistent layout should drop the old volumes exactly once:
+| Dimension | Source `compose.yml` | Published `compose.published.yml` |
+|---|---|---|
+| Services | 9 in the default render; `vault-loader` hidden behind the `bootstrap` profile | 10; `vault-loader` is a default one-shot service |
+| Java images | built from sibling repos (`build: ../<service>`) | pulled from GHCR (`ghcr.io/elara-app/<service>:latest` in the file) |
+| Config source | read-only bind mount `../centralized-configuration:/config-repo`; Config Server `clone-on-start: false`, first request pays the clone | Config Server clones `github.com/elara-app/centralized-configuration` at startup (`clone-on-start: true`), label `main` in the file |
+| Vault loader | profile-gated: hidden behind `bootstrap`, run manually as a one-shot; the host script is an alternative | inline default service: runs automatically before the business services and verifies both dev paths |
+| Postgres databases | both containers create `inventory_db` and `unit_of_measure_db` via the init script | one database each (`POSTGRES_DB`), no init script |
+| Restart cascade | `depends_on` uses `restart: true` on gateway and business services: a Compose restart of a dependency cascades | no `restart: true`: restarting Postgres or Vault leaves the services running |
+| Host bindings | 8888/8761/8080/5672/15672/8200 on all interfaces; 8081/8082 loopback-only | all 8 mappings loopback by default via `ELARA_BIND` |
 
-```bash
-sudo docker compose down
-sudo docker volume rm elara_pgdata-inventory elara_pgdata-uom 2>/dev/null || true
-test -z "$(sudo docker volume ls -q --filter name=elara_pgdata)"
-```
+Lifecycle: `config-service` and `discovery-service` start in parallel (neither declares `depends_on`); Postgres, RabbitMQ and Vault start in parallel; each business service waits for config, discovery, its Postgres, RabbitMQ and Vault to be healthy (published additionally waits for the loader to complete); `api-gateway` waits for all four. Both stacks discard state by design: the Postgres tmpfs and the in-memory Vault are emptied by `down`, `restart` or container recreation. Source restarts cascade; published restarts do not (see `docs/operations.md`).
 
-### Startup seed (dev)
+## Interfaces
 
-`inventory-service` and `unit-of-measure-service` run `db/dev/seed.sql` on startup (dev
-profile only). SQL initialization is deferred until after Hibernate creates/updates the
-schema and completes during application startup before the HTTP port opens, so a healthy
-container already carries the demo records:
+| Service | Role | Host port (source) | Key dependency |
+|---|---|---|---|
+| `config-service` | Spring Cloud Config Server | 8888 | none |
+| `discovery-service` | Eureka registry | 8761 | none |
+| `api-gateway` | Edge router and Swagger UI | 8080 | config, discovery, inventory, UOM healthy |
+| `inventory-service` | Item master data API | `127.0.0.1:8081` | config, discovery, postgres-inventory, rabbitmq, vault |
+| `unit-of-measure-service` | UOM catalog and status API | `127.0.0.1:8082` | config, discovery, postgres-uom, rabbitmq, vault |
+| `postgres-inventory` / `postgres-uom` | Databases | none (expose 5432) | none |
+| `rabbitmq` | Broker for Spring Cloud Bus refresh | 5672, 15672 | none |
+| `vault` | Dev-mode Vault (in-memory) | 8200 | none |
+| `vault-loader` | One-shot secret bootstrap | none | vault healthy |
 
-| rows | contents |
-| --- | --- |
-| `inventory_item` | `Steel Bolt M10` (uom 1), `Aluminum Sheet 4x8` (uom 2), plus 8 warehouse items (uom 1) |
-| `uom_status` | `Active`, `Inactive`, `Deprecated` |
-| `uom` | `Kilogram` (factor 1.000), `Gram` (0.001), `Pound` (0.454), `Ounce` (0.028), `Tonne` (1000.000) |
+Published replaces every host port with `${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_<NAME>:-<default>}`. Endpoints once the stack is healthy: Swagger UI `http://127.0.0.1:8080/swagger-ui.html`; Config Server `http://127.0.0.1:8888/<application>/<profile>`; Eureka dashboard and registry `http://127.0.0.1:8761` and `/eureka/apps`; RabbitMQ management `http://127.0.0.1:15672`; Vault `http://127.0.0.1:8200`.
 
-The inserts are idempotent (`ON CONFLICT DO NOTHING` plus identity-sequence resync), so
-restarting only the service never duplicates rows. The inventory `base_unit_of_measure_id`
-values 1 and 2 are a deliberate id contract with the UoM seed. UoM ids 3-5 are additional
-units for API tests; the inventory items keep referencing 1/2.
+## Run and verify
 
-Restart semantics that go with ephemeral data:
+Prerequisites: Docker Engine with the Compose v2 plugin (`docker compose version`), and either `sudo` or membership in the `docker` group. The source stack additionally needs the five sibling repositories checked out next to `infra/` (build contexts), with their Dockerfiles and `.dockerignore` files.
 
-- `docker compose restart postgres-inventory` / `postgres-uom` also restarts the dependent
-  service and the gateway (`depends_on: restart: true`), which re-creates the schema and
-  re-runs the seed.
-- Postgres-scoped operations that bypass that cascade — `restart --no-deps` on a Postgres
-  service, a raw `docker restart` of it, an OOM kill of it, or `docker compose stop
-  postgres-inventory postgres-uom` + `start` for those two — discard the tmpfs and leave
-  the business services running against a database with no tables until you run
-  `docker compose restart inventory-service unit-of-measure-service` (or force-recreate
-  them).
-- Restarting `vault` empties its in-memory store: re-run the profile-gated loader.
-- A host reboot or Docker daemon restart restarts every container by its
-  `restart: unless-stopped` policy, so the services rebuild the schema and re-seed by
-  themselves; only Vault's in-memory store stays empty, so re-run the loader as well.
-
-## Vault secrets (`scripts/setup-vault.sh`)
-
-`centralized-configuration/service-secrets/` holds one JSON per service and profile,
-named `<spring.application.name>-<profile>-secrets.json`. The script validates each
-file with `jq`, derives the Vault path from that filename (`secret/<app>/<profile>`,
-e.g. `secret/unit-of-measure-service/dev` — never a short prefix such as `uom`), and
-writes each entry as a separate `key=value` argument.
+Canonical full-stack commands:
 
 ```bash
-export VAULT_ADDR=http://127.0.0.1:8200
-export VAULT_TOKEN=00000000-0000-0000-0000-000000000000   # or $VAULT_DEV_ROOT_TOKEN_ID
-SECRETS_DIR=../centralized-configuration/service-secrets \
-PROFILES=dev ./scripts/setup-vault.sh
+# Source checkout: absolute path to infra/compose.yml
+export ELARA="/absolute/path/to/elara/infra/compose.yml"
+
+# Or the published demo artifact:
+# export ELARA="oci://ghcr.io/elara-app/elara-demo:latest"
+
+sudo docker compose -f "$ELARA" up -d --wait --wait-timeout 900
+sudo docker compose -f "$ELARA" logs -f
+sudo docker compose -f "$ELARA" down
 ```
 
-Behaviour:
+`up -d --wait` blocks until every long-running service is healthy (up to 15 minutes). The source stack builds five images and the loader; the published stack only pulls images. `logs -f` follows until Ctrl+C. `down` removes the containers and, with them, the ephemeral Postgres data and Vault secrets.
 
-- `vault`, `jq` and `base64` must be in `PATH`; the missing binary is named in the error.
-- `VAULT_TOKEN` is required; `vault login` fails fast on a wrong token.
-- Vault is polled until it answers unsealed (`WAIT_TIMEOUT`, default 60s).
-- Load is get-or-put: an existing path is reported as skipped, never overwritten, so
-  re-running is safe in local dev and CI.
-- Each JSON entry becomes exactly one `key=value` argument (base64-encoded by `jq`,
-  decoded by the shell), so values containing `=` or newlines stay a single argument.
-  A file that yields no pairs (for example `{}`) is skipped with an informational message.
-- A summary (`loaded=`, `skipped=`, `failed=`) is printed; any failure exits non-zero.
-- `SECRETS_DIR` defaults to `<script_dir>/../centralized-configuration/service-secrets`,
-  i.e. the config repo checked out next to `scripts/` (export it to point elsewhere, as in
-  the example above). `PROFILES`, `PROFILE`, `WAIT_TIMEOUT`, `--all-profiles` and
-  `--profiles dev,test` select what gets loaded; files of other profiles (including prod
-  files kept on disk by the DEV-ONLY policy) are simply not selected.
+### Verify the stack
 
-### Vault bootstrap under compose (one-shot)
+- Swagger UI: `http://127.0.0.1:8080/swagger-ui.html`
+- Inventory collection through the gateway: `http://127.0.0.1:8080/api/v1/inventory/item/`
+- UOM root: `http://127.0.0.1:8080/api/v1/uom/`
+- UOM status root: `http://127.0.0.1:8080/api/v1/uom/status/`
 
-The default stack renders nine services: a profile-gated `vault-loader` helper exists
-but stays hidden from the default `config`/`up` render (default render is still exactly
-9 services). Run it as a container one-shot against the `vault` service:
+The gateway prefix `/api/v1/inventory` is not the inventory collection path; `StripPrefix=3` maps `/api/v1/inventory/item/` to the service's `/item/` controller mapping.
+
+Expected seeded page counts (nested page shape):
 
 ```bash
-docker compose up -d vault        # dev mode: unsealed, root token from the compose default or an explicit environment override
-sudo docker compose --profile bootstrap up vault-loader   # waits for `vault` healthy via depends_on, loads `dev` by default
+curl -s http://127.0.0.1:8080/api/v1/inventory/item/ | jq '.page.totalElements'   # 10
+curl -s http://127.0.0.1:8080/api/v1/uom/ | jq '.page.totalElements'            # 5
+curl -s http://127.0.0.1:8080/api/v1/uom/status/ | jq '.page.totalElements'     # 3
 ```
 
-Profile selection: `VAULT_LOAD_PROFILES=test` in the environment or `--profiles dev,test` appended
-to the run command changes what gets loaded. Host one-shot kept as alternative:
+Scripted checks (see `docs/operations.md` for what each one proves):
 
 ```bash
-export VAULT_ADDR=http://localhost:8200       # host side = the published port 8200
-export VAULT_TOKEN=$VAULT_DEV_ROOT_TOKEN_ID   # or the literal dev root token
-SECRETS_DIR=../centralized-configuration/service-secrets \
-PROFILES=dev ./scripts/setup-vault.sh
+docker compose -f compose.yml config --quiet                      # offline render check
+docker compose -f compose.published.yml config --quiet            # offline render check
+COMPOSE_REF=./compose.published.yml bash scripts/smoke-test.sh    # starts the published stack
+COMPOSE_REF=./compose.published.yml bash scripts/flow-check.sh    # needs the stack running
+COMPOSE_REF=oci://ghcr.io/elara-app/elara-demo:latest bash scripts/smoke-test.sh
 ```
 
-It is a one-shot and idempotent (existing paths are reported as skipped), so re-running
-never overwrites anything. Run it **before** `inventory-service` and
-`unit-of-measure-service`: both import `optional:vault://secret/<app>/dev` with
-`fail-fast: false`, so they tolerate an empty Vault and still come up — but ETAPA-04's E4
-(`vault kv get secret/<app>/dev`) only passes once the loader has run, and it must assert
-all 4 keys each service's dev secret carries (spring.datasource.username/password +
-spring.rabbitmq.username/password).
+`smoke-test.sh` brings the published stack up, asserts 3 Eureka applications, seed counts 10/5/3 through the gateway, exactly 10 Compose services (9 healthy plus an exited `vault-loader`) and 4 keys in both Vault dev paths. `flow-check.sh` never starts the stack: it POSTs one inventory item through the gateway, waits for the inventory and UOM log markers, deletes the item and waits for the count to return to 10. Both scripts target the published stack (project `elara-demo`). Live `sudo docker compose up` was not run in this documentation workspace; validation here was static (`config --quiet` renders and `bash -n`), so run the manual acceptance above on a machine with a working daemon.
 
-The script needs `bash`, `vault`, `jq` AND `base64`. The official `hashicorp/vault` images
-ship none of `bash`/`jq`/`base64`, and Alpine has no `vault` package, so the loader image
-(`vault-loader/Dockerfile`) is multi-stage: it COPYs `/bin/vault` from
-`hashicorp/vault:1.16` (CLI 1.16 == server 1.16) and runs `apk add bash jq coreutils`
-(`base64` ships in coreutils) on `alpine:3.21` — running the script from the host, as
-above, avoids that entirely.
+## Configuration
 
-## DEV-ONLY policy and prod gating
+No `.env` file is checked in or supported: every interpolated value carries a `${VAR:-default}` and the defaults are the supported configuration. Compose still auto-loads a stray `.env`, which can inject host loopbacks into containers, so do not add one.
 
-By default only `*-dev-secrets.json` files are loaded, against a local Vault dev server.
-Loading the `prod` profile requires both a non-local `VAULT_ADDR` (anything other than
-`127.0.0.1`/`localhost`/`0.0.0.0`/`[::]`/`[::1]`) and `CONFIRM_PROD=yes`. There is no
-interactive prompt, so unattended runs can never hang, and a misconfigured local run is
-refused before any network contact. The gate applies only to files actually being loaded:
-a `*-prod-secrets.json` sitting next to the dev files does not break a plain dev run.
-The values in `centralized-configuration/service-secrets/` are dev-only credentials
-(`postgres/postgres` + `elara/elara`) and are safe to version; real secrets belong in
-Vault only.
+Source knobs: `CONFIG_GIT_URI` (default `/config-repo`), `CONFIG_GIT_DEFAULT_LABEL` (default `main`), `VAULT_LOAD_PROFILES` (default `dev`), `POSTGRES_USER`/`POSTGRES_PASSWORD`, `TZ`, `RABBITMQ_DEFAULT_USER`/`RABBITMQ_DEFAULT_PASS`, `VAULT_DEV_ROOT_TOKEN_ID`, `SERVER_PORT_*`, `CONFIG_URI`, `EUREKA_URI`, `VAULT_URI`, and the datasource/RabbitMQ variables. Published knobs: `ELARA_BIND` (default `127.0.0.1`), one `ELARA_PORT_<SERVICE>` per mapping (defaults 8888/8761/8080/8081/8082/5672/15672/8200) and `VAULT_DEV_ROOT_TOKEN_ID`.
 
-## Running the stack (compose)
+Service-specific configuration, the profile matrix and Vault paths (`secret/inventory-service/dev`, `secret/unit-of-measure-service/dev`) live in `centralized-configuration`. The full environment contract is in `docs/operations.md`.
 
-`compose.yml` starts all nine services of the default stack on the `elara-net` bridge network. Every
-interpolated value is written `${VAR:-<container DNS default>}`, so the stack is correct
-with **no environment file** — the defaults already are the compose service names.
+## Testing and quality gates
 
-```bash
-docker compose config            # validate the file offline: no daemon needed
-docker compose up -d --build     # build the five images and start everything (needs the daemon)
-docker compose ps                # per-service state and health
-docker compose logs <service> --tail=100
-docker compose down              # stop; the tmpfs databases are discarded with the containers
-docker compose down -v           # equivalent here: the stack declares no volumes to drop
-```
+- `docker compose -f compose.yml config --quiet` and `docker compose -f compose.published.yml config --quiet` must pass; CI also renders the logs overlay and asserts the published contract (service list, ports, healthchecks, loader, image pins).
+- `bash -n scripts/*.sh postgres/init-multiple-dbs.sh` must pass.
+- `.github/workflows/compose-checks.yml` runs on pull requests to `develop`/`main`; it is static (no container start).
+- `.github/workflows/publish-compose.yml` runs on push to `main`: publishes the `sha-<7>` artifact (digest-pinned images, config commit SHA label), verifies its structure, smokes it, then publishes `latest` only when the run is current infra `main`, smokes latest on amd64 and arm64, and runs `flow-check.sh`. Markdown-only pushes skip publishing.
+- `bash scripts/check-release-version.sh` checks that `VERSION` (currently `1.3.1`) matches all five service poms; it is manual and needs network access.
 
-### Environment contract — no `.env` file
+## Current limitations
 
-Every value compose interpolates carries a `${VAR:-default}`, and the defaults point at
-container DNS: `config-service:8888`, `discovery-service:8761`, `vault:8200`,
-`rabbitmq:5672`, `postgres-inventory`/`postgres-uom:5432`. The compose defaults are the
-only supported configuration.
+- The published stack is a demo, not production: dev Vault with a known root token, dev database and RabbitMQ credentials, no persistence, no TLS, a public GitHub config clone and a single Eureka registry.
+- All state is ephemeral by design; there is no backup or persistence path.
+- `:latest` floats, and a cached pull can be stale; only the `sha-<7>` and `1.3.1` artifacts pin images by digest and the config by commit SHA.
+- Published `config-service` needs GitHub access at startup; the source bind mount is the offline path.
+- Scaling is a source-checkout capability only and is blocked by host publishes until you remove them with an override; `discovery-service` is a single registry, not a cluster.
+- The published `vault-loader` runs before the business services only because of `depends_on`; restarting Vault alone does not re-run it.
+- CI runs `flow-check.sh` only after `latest` is published, so a flow regression can leave `latest` published.
 
-Do not add a `.env`: Compose auto-loads one from this directory and it beats the compose
-defaults. A stray `.env` that carries host loopbacks (`localhost`/`127.0.0.1`) injects
-them into the containers, where `localhost` is the container itself — the services then
-cannot reach the config server, Eureka, the broker or Vault, health reports `DOWN`, and
-`api-gateway` waits forever on `depends_on`.
+## Troubleshooting
 
-Explicit shell or command overrides (`VAR=... docker compose up -d`) remain possible for
-local experiments, but they are not a checked-in contract. Use the compose defaults.
+| Symptom | Cause | Fix |
+|---|---|---|
+| Published services return database errors after restarting Postgres | no `restart: true` in the published stack; the tmpfs database is empty | `docker compose restart inventory-service unit-of-measure-service` |
+| `vault kv get` returns 403/404 after restarting Vault | Vault dev storage is in-memory | re-run the loader (source: `--profile bootstrap up vault-loader`; published: `up -d vault-loader`) |
+| The published stack still runs old code after `up` | `:latest` pull policy keeps a cached image | use `:sha-<7>`/`:1.3.1`, or run `docker compose pull` first |
+| The source loader reports `skip` for a path you want to change | get-or-put never overwrites an existing path | remove the Vault path or load a new profile, then re-run |
+| The loader fails with "secrets directory does not exist" | the script default `SECRETS_DIR` resolves under `infra/` and does not exist | pass `SECRETS_DIR=../centralized-configuration/service-secrets` |
+| Published `config-service` stays unhealthy | no GitHub access for the startup clone | fix connectivity, or use the source stack |
+| `up` fails with a port conflict | another stack or process uses the same host port | stop the other stack, or change `ELARA_PORT_*` (published) |
 
-Compose never sets `SPRING_PROFILES_ACTIVE`: the three profile-reading services
-(`api-gateway`, `inventory-service`, `unit-of-measure-service`) already default to
-`SPRING_PROFILES_ACTIVE=dev` in their own `application.yml`, so no env var is needed.
+## Documentation
 
-### Start order
-
-`depends_on: {condition: service_healthy, restart: true}` already encodes the order —
-infra (both Postgres, RabbitMQ, Vault) → `discovery-service` → `config-service` → the two
-business services → `api-gateway` — so a single `docker compose up -d --build` is safe.
-Step by step, if you prefer to read the logs service by service, use the same order:
-
-```bash
-docker compose up -d --build postgres-inventory postgres-uom rabbitmq vault
-docker compose up -d --build discovery-service
-docker compose up -d --build config-service
-docker compose up -d --build inventory-service unit-of-measure-service
-docker compose up -d --build api-gateway
-```
-
-The Vault secret loader is the one thing `depends_on` cannot do for the business
-services: run the profile-gated one-shot (container or host) once between `vault` and
-the business services (see "Vault bootstrap under compose" above).
-
-The order above is enforced while starting or recreating containers. An explicit
-`docker compose restart <service>` also restarts its dependents (`restart: true`), but
-container-runtime restarts (daemon restart, host reboot, OOM) do not re-evaluate
-`depends_on`; see "Startup seed" for how that interacts with the ephemeral databases.
-
-### Published ports
-
-| host port | service | note |
-| --- | --- | --- |
-| `8888` | `config-service` | config endpoint `/<app>/<profile>` + `/actuator/health` |
-| `8761` | `discovery-service` | Eureka dashboard + `/eureka/apps` |
-| `8080` | `api-gateway` | the only public entry point (`/api/v1/...`, `/inventory-service/...`, Swagger UI at `/webjars/swagger-ui/index.html`; `/swagger-ui.html` redirects there) |
-| `5672` | `rabbitmq` | AMQP (dev) |
-| `15672` | `rabbitmq` | management UI/API (dev) |
-| `8200` | `vault` | dev-mode Vault (dev) |
-| `127.0.0.1:8081` | `inventory-service` | debug only, loopback-bound |
-| `127.0.0.1:8082` | `unit-of-measure-service` | debug only, loopback-bound |
-
-`5432` is deliberately **not** published: Postgres is reachable on `elara-net` only, and
-`docker compose exec postgres-inventory pg_isready -U postgres -d inventory_db` is the way
-to check it. Every service also declares `expose`, documenting the in-network port for
-parity with the image's EXPOSE; it is documentation only — on a user-defined bridge
-containers reach each other regardless of EXPOSE.
-
-### The nine default services
-
-| service | image / build | ports | healthcheck |
-| --- | --- | --- | --- |
-| `config-service` | `build: ../config-service` | `8888:8888` | `curl -f http://localhost:8888/actuator/health` (start_period 90s) |
-| `discovery-service` | `build: ../discovery-service` | `8761:8761` | `curl -f http://localhost:8761/actuator/health` (60s) |
-| `api-gateway` | `build: ../api-gateway` | `8080:8080` | `curl -f http://localhost:8080/actuator/health` (60s) |
-| `inventory-service` | `build: ../inventory-service` | `127.0.0.1:8081:8081` | `curl -f http://localhost:8081/actuator/health` (90s) |
-| `unit-of-measure-service` | `build: ../unit-of-measure-service` | `127.0.0.1:8082:8082` | `curl -f http://localhost:8082/actuator/health` (90s) |
-| `postgres-inventory` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -h 127.0.0.1 -p 5432 -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
-| `postgres-uom` | `postgres:16-alpine` | none (expose 5432) | `pg_isready -h 127.0.0.1 -p 5432 -U $POSTGRES_USER -d $POSTGRES_DB` (30s) |
-| `rabbitmq` | `rabbitmq:3-management-alpine` | `5672:5672`, `15672:15672` | `rabbitmq-diagnostics ping` (40s) |
-| `vault` | `hashicorp/vault:1.16` (dev) | `8200:8200` | `vault status` (20s) |
-
-The five Java images are built from the sibling repos (`build: ../<service>`), so all five
-`Dockerfile`s and `.dockerignore`s from Etapa-03 must exist before `up --build`. Both
-Postgres containers keep their data on the ephemeral tmpfs described in "Ephemeral data
-directory", and both mount `./postgres/init-multiple-dbs.sh` into
-`/docker-entrypoint-initdb.d/`.
-
-The env names each container reads are defined as defaults in `compose.yml`
-(`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_MULTIPLE_DATABASES`,
-`RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`, `VAULT_DEV_ROOT_TOKEN_ID`,
-`CONFIG_GIT_URI`, `SERVER_PORT_*`, `CONFIG_URI`, `EUREKA_URI`, `VAULT_URI`, `VAULT_TOKEN`,
-`SPRING_CLOUD_VAULT_TOKEN`, `SPRING_DATASOURCE_*`, `SPRING_RABBITMQ_*`), but with
-container DNS values instead of loopback: `http://config-service:8888`,
-`http://discovery-service:8761/eureka/`, `http://vault:8200`, `rabbitmq`,
-`jdbc:postgresql://postgres-<inventory|uom>:5432/<inventory_db|unit_of_measure_db>`.
-`VAULT_TOKEN` and `SPRING_CLOUD_VAULT_TOKEN` are the I-06 double mapping: both are fed
-from `VAULT_DEV_ROOT_TOKEN_ID`, so the YAML placeholder and Boot's relaxed binding can
-never drift into a 403. The vault container keeps its own literal
-`VAULT_ADDR=http://127.0.0.1:8200`, because its healthcheck runs `vault status` inside the
-container and the Vault CLI would otherwise default to `https`.
-
-### Running multiple instances
-
-The gateway and the two business services are stateless and register in Eureka; the gateway
-resolves inventory and unit of measure with `lb://` (Spring Cloud LoadBalancer, round-robin).
-Only those three are Eureka clients; `config-service` and `discovery-service` are outside
-the `lb://` path. `discovery-service` is the single registry — scaling it as-is would create
-an independent registry, not a replica — so it is out of scope here.
-
-- Each replica registers as `${spring.application.name}:${random.uuid}` with
-  `prefer-ip-address: true`, so instances do not overwrite each other in the registry.
-- The gateway targets `lb://inventory-service` and `lb://unit-of-measure-service`; it
-  neither knows nor needs the instance port.
-- The dev seed is idempotent (`ON CONFLICT DO NOTHING`), so a second inventory or unit of
-  measure instance can start against the same database without duplicating rows.
-- No service sets `container_name`, so Compose can create more than one container per
-  service.
-
-**Bare metal / JVM.** `server.port` is `${SERVER_PORT:8081}` (inventory) and
-`${SERVER_PORT:8082}` (unit of measure) in `centralized-configuration`. From `infra/`,
-start a second copy with a different port, or let the OS pick one:
-
-```bash
-cd ../inventory-service && SERVER_PORT=0 java -jar target/inventory-service-*.jar
-```
-
-With `SERVER_PORT=0`, the bound port appears in the startup log and is what Eureka
-registers, so the gateway reaches the new instance. Start the first instance and wait for
-its health endpoint before starting the next: the `dev` profile uses `ddl-auto: update`, and
-concurrent schema updates against the same database are not safe (see the limitation below).
-
-**Docker Compose.** The in-container port is not the blocker: every container has its own
-network namespace, so two replicas can both listen on `8081` (or `8082`). The **host**
-publish is what prevents `--scale` (the `127.0.0.1:8081:8081` entry in "The nine default
-services"), because both replicas would bind the same host port. Drop the publish for the
-replicas with an override file and scale in two steps, waiting for the first replica to be
-healthy before adding the second (see the limitation below):
-
-```yaml
-# scale.override.yml
-services:
-  inventory-service:
-    ports: !reset []
-  unit-of-measure-service:
-    ports: !reset []
-```
-
-```bash
-# 1. Start one replica and wait until it is healthy.
-docker compose -f compose.yml -f scale.override.yml up -d
-
-# 2. Add the second replica; the schema already exists.
-docker compose -f compose.yml -f scale.override.yml up -d --scale inventory-service=2
-```
-
-`!reset` is supported by current Compose releases; the publish workflow pins Compose
-2.40.3. The container healthchecks probe `localhost:8081` (inventory) and `localhost:8082`
-(unit of measure) inside each replica, so they keep working; the gateway also exposes
-`/api/v1/inventory/actuator/health` and `/api/v1/uom/actuator/health` for external checks.
-The per-container probe stays local on purpose: if it depended on the gateway, while the
-gateway waits for the service to be healthy, the startup would deadlock.
-
-**Limitation.** The `dev` profile uses `ddl-auto: update` and runs the SQL seed on every
-start. The seed is idempotent, but Hibernate's schema update is not safe under concurrent
-startup: start one instance, wait for it to be healthy, then start the next. For a
-production-grade multi-instance deployment, replace `ddl-auto: update` with a migration
-tool (Flyway or Liquibase) that applies each schema version once.
-
-The published artifact (`elara-demo:<version>`) ships `compose.published.yml`; the override
-above is a source-checkout capability. The artifact keeps the debug port bindings for the
-single-instance demo.
-
-### Memory and JVM sizing
-
-`mem_limit` is `512M` for `api-gateway`, `inventory-service`, `unit-of-measure-service` and
-both Postgres containers (the limit also covers the tmpfs pages charged to the container),
-`256M` for `config-service`, `discovery-service` and `rabbitmq`, and `128M` for `vault`.
-Each of the five Java services gets exactly
-`JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75` and no other JVM flag, so the JVM sizes its
-heap from the container limit at startup (75% of `mem_limit`) — tune `mem_limit`, never
-`-Xmx`, and note that the Dockerfiles keep no hardcoded heap of their own. All nine
-services run with `restart: unless-stopped`; the profile-gated `vault-loader` is a one-shot
-with `restart: "no"`.
-
-### Config source (`CONFIG_GIT_URI`)
-
-`config-service` clones from `CONFIG_GIT_URI`, whose default is `/config-repo` — a
-read-only bind mount of `../centralized-configuration`, relative to `compose.yml`. JGit
-only reads that repo and clones it into the container's own basedir, so `:ro` is enough,
-and the stack works offline with no GitHub credentials. To clone from GitHub or from
-another branch instead, set in the environment:
-
-```bash
-CONFIG_GIT_URI=https://github.com/elara-app/centralized-configuration.git
-CONFIG_GIT_DEFAULT_LABEL=main      # branch the Config Server clones
-```
-
-`CONFIG_GIT_DEFAULT_LABEL` maps to `SPRING_CLOUD_CONFIG_SERVER_GIT_DEFAULT_LABEL` and
-matches `default-label: main` in `config-service/application.yml`. The port of
-`discovery-service` is hardcoded (`server.port: 8761`, no placeholder in its
-`application.yml`), so `SERVER_PORT_DISCOVERY` is belt-and-braces there.
-
-## Verification status
-
-This stage verifies with deterministic offline proofs only: `bash -n`, `jq empty`, git
-mode checks, mocked `vault`/`psql` CLIs that exercise the retry, idempotency and failure
-paths, plus `docker compose config` (which needs no daemon) over the whole `compose.yml`
-and `python3 -c "yaml.safe_load(...)"` structural checks of the same file. Compose is never
-allowed to reach the daemon here: image builds (`docker build`) and container runtime
-verification are **deferred to ETAPA-04 (E0/E1)**, as is the live evidence (Vault healthy,
-`vault kv get secret/<app>/dev` returning all 4 keys of each service's dev secret,
-`SELECT 1` against both databases — E3/E6/E7), because
-this development machine has no Docker daemon.
+- [`AGENTS.md`](AGENTS.md) — agent rules, invariants, commands and traps for this repository.
+- [`docs/operations.md`](docs/operations.md) — detailed operations: Vault bootstrap, Postgres/seed/restart semantics, scaling, published artifacts, scripts, gotchas.
+- [`docs/etapa-04-runbook.md`](docs/etapa-04-runbook.md) — historical stage-4 runbook; superseded, kept as a pointer only.
+- `centralized-configuration` — profile matrix, property ownership, Vault secret paths: <https://github.com/elara-app/centralized-configuration>.
+- Service repositories: <https://github.com/elara-app/api-gateway>, <https://github.com/elara-app/discovery-service>, <https://github.com/elara-app/config-service>, <https://github.com/elara-app/inventory-service>, <https://github.com/elara-app/unit-of-measure-service>.
