@@ -1,6 +1,6 @@
 # Elara infrastructure
 
-`infra` owns the local orchestration of the Elara platform: the source stack in `compose.yml`, the pull-only published demo stack in `compose.published.yml`, the Vault bootstrap (loader image and `scripts/setup-vault.sh`), the multi-database Postgres init script, the verification scripts under `scripts/` and the GitHub Actions workflows that publish and smoke the demo artifact. It contains no application code: in the source stack the five Java services are built from their sibling repositories, and their shared non-secret configuration lives in `centralized-configuration`. The published stack is a demo, not a production deployment.
+`infrastructure` owns the local orchestration of the Elara platform: the source stack in `compose.yml`, the pull-only published demo stack in `compose.published.yml`, the Vault bootstrap (loader image and `scripts/setup-vault.sh`), the multi-database Postgres init script, the verification scripts under `scripts/` and the GitHub Actions workflows that publish and smoke the demo artifact. It contains no application code: in the source stack the five Java services are built from their sibling repositories, and their shared non-secret configuration lives in `centralized-configuration`. The published stack is a demo, not a production deployment.
 
 ## At a glance
 
@@ -16,7 +16,7 @@
 
 ## Responsibilities and boundaries
 
-`infra` owns:
+`infrastructure` owns:
 
 - Both Compose stacks: service inventory, host ports, healthchecks, dependency conditions, restart policies and memory limits.
 - The Vault bootstrap: `vault-loader/Dockerfile`, `scripts/setup-vault.sh`, the source `vault-loader` service and the published inline loader.
@@ -24,7 +24,7 @@
 - The published demo artifact and the publish/smoke workflows in `.github/workflows/`.
 - The verification scripts: `scripts/smoke-test.sh`, `scripts/flow-check.sh`, `scripts/check-release-version.sh`.
 
-`infra` does not own:
+`infrastructure` does not own:
 
 - Application code, API behavior, Spring profiles or seed SQL; each service repository owns them.
 - Shared non-secret configuration, the profile matrix and the dev-only secret JSON files; `centralized-configuration` owns them.
@@ -64,13 +64,13 @@ Published replaces every host port with `${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_<
 
 ## Run and verify
 
-Prerequisites: Docker Engine with the Compose v2 plugin (`docker compose version`), and either `sudo` or membership in the `docker` group. The source stack additionally needs the five sibling repositories checked out next to `infra/` (build contexts), with their Dockerfiles and `.dockerignore` files.
+Prerequisites: Docker Engine with the Compose v2 plugin (`docker compose version`), and either `sudo` or membership in the `docker` group. The source stack additionally needs the five sibling repositories checked out next to `infrastructure/` (build contexts), with their Dockerfiles and `.dockerignore` files.
 
 Canonical full-stack commands:
 
 ```bash
-# Source checkout: absolute path to infra/compose.yml
-export ELARA="/absolute/path/to/elara/infra/compose.yml"
+# Source checkout: absolute path to infrastructure/compose.yml
+export ELARA="/absolute/path/to/elara/infrastructure/compose.yml"
 
 # Or the published demo artifact:
 # export ELARA="oci://ghcr.io/elara-app/elara-demo:latest"
@@ -124,7 +124,7 @@ Service-specific configuration, the profile matrix and Vault paths (`secret/inve
 - `docker compose -f compose.yml config --quiet` and `docker compose -f compose.published.yml config --quiet` must pass; CI also renders the logs overlay and asserts the published contract (service list, ports, healthchecks, loader, image pins).
 - `bash -n scripts/*.sh postgres/init-multiple-dbs.sh` must pass.
 - `.github/workflows/compose-checks.yml` runs on pull requests to `develop`/`main`; it is static (no container start).
-- `.github/workflows/publish-compose.yml` runs on push to `main`: publishes the `sha-<7>` artifact (digest-pinned images, config commit SHA label), verifies its structure, smokes it, then publishes `latest` only when the run is current infra `main`, smokes latest on amd64 and arm64, and runs `flow-check.sh`. Markdown-only pushes skip publishing.
+- `.github/workflows/publish-compose.yml` runs on push to `main`: publishes the `sha-<7>` artifact (digest-pinned images, config commit SHA label), verifies its structure, smokes it, then publishes `latest` only when the run is current `infrastructure` main branch, smokes latest on amd64 and arm64, and runs `flow-check.sh`. Markdown-only pushes skip publishing.
 - `bash scripts/check-release-version.sh` checks that `VERSION` (currently `1.3.1`) matches all five service poms; it is manual and needs network access.
 
 ## Current limitations
@@ -145,7 +145,7 @@ Service-specific configuration, the profile matrix and Vault paths (`secret/inve
 | `vault kv get` returns 403/404 after restarting Vault | Vault dev storage is in-memory | re-run the loader (source: `--profile bootstrap up vault-loader`; published: `up -d vault-loader`) |
 | The published stack still runs old code after `up` | `:latest` pull policy keeps a cached image | use `:sha-<7>`/`:1.3.1`, or run `docker compose pull` first |
 | The source loader reports `skip` for a path you want to change | get-or-put never overwrites an existing path | remove the Vault path or load a new profile, then re-run |
-| The loader fails with "secrets directory does not exist" | the script default `SECRETS_DIR` resolves under `infra/` and does not exist | pass `SECRETS_DIR=../centralized-configuration/service-secrets` |
+| The loader fails with "secrets directory does not exist" | the script default `SECRETS_DIR` resolves under `infrastructure/` and does not exist | pass `SECRETS_DIR=../centralized-configuration/service-secrets` |
 | Published `config-service` stays unhealthy | no GitHub access for the startup clone | fix connectivity, or use the source stack |
 | `up` fails with a port conflict | another stack or process uses the same host port | stop the other stack, or change `ELARA_PORT_*` (published) |
 

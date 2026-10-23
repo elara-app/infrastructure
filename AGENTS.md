@@ -1,4 +1,4 @@
-# AGENTS — infra
+# AGENTS — infrastructure
 
 ## Read first
 
@@ -72,7 +72,7 @@ Full-stack `up`/`logs`/`down` commands: `README.md` → "Run and verify".
 - Restart: long-running services are `restart: unless-stopped`; loaders are `restart: "no"`. Source gateway/business dependencies carry `restart: true`; published carries none.
 - Network and storage: exactly one bridge network `elara-net`; no top-level volumes, configs or secrets; Postgres PGDATA on a 128 MiB tmpfs; Vault dev mode with in-memory storage.
 - Logging: bounded `json-file` (`max-size: 10m`, `max-file: 3`) on every service.
-- Images: infra images stay pinned (`postgres:16.15-alpine`, `rabbitmq:3.13.7-management-alpine`, `hashicorp/vault:1.16.3`). Published Elara images are `:latest` in the file; the `sha-<7>` and version artifacts pin all ten service images by digest and the config label to a commit SHA.
+- Images: infrastructure images stay pinned (`postgres:16.15-alpine`, `rabbitmq:3.13.7-management-alpine`, `hashicorp/vault:1.16.3`). Published Elara images are `:latest` in the file; the `sha-<7>` and version artifacts pin all ten service images by digest and the config label to a commit SHA.
 
 ## Configuration and runtime
 
@@ -84,12 +84,12 @@ Full-stack `up`/`logs`/`down` commands: `README.md` → "Run and verify".
 
 ## Cross-repo change protocol
 
-Changing a port, route path, service ID, database topology, Vault path or secret key requires coordinated changes, in this order: `centralized-configuration` (property/Vault/label files), the affected service (only its own config/README), `api-gateway` routing through the central config, `infra` Compose files and their CI assertions, then the docs (`infra/README.md`, `infra/docs/operations.md`). Never land one side alone: CI asserts the published structure, and a half-migrated stack breaks the smoke and flow checks.
+Changing a port, route path, service ID, database topology, Vault path or secret key requires coordinated changes, in this order: `centralized-configuration` (property/Vault/label files), the affected service (only its own config/README), `api-gateway` routing through the central config, `infrastructure` Compose files and their CI assertions, then the docs (`README.md`, `docs/operations.md`). Never land one side alone: CI asserts the published structure, and a half-migrated stack breaks the smoke and flow checks.
 
 ## Testing and quality gates
 
 - PR gate (`compose-checks.yml`): renders source, published, a host-token-drift render, per-port overrides and the logs overlay; asserts the published service list, loopback ports, image pins, healthchecks, dependency conditions, loader command, one-DB-per-Postgres policy, logging and overlay invariants. Static only.
-- Publish gate (`publish-compose.yml`): preflight, publish `sha-<7>` (digest-pinned images + config commit SHA label), verify structure, smoke sha, publish `latest` only when the run is current infra `main`, smoke latest on amd64+arm64, start Dozzle, run `flow-check.sh`, tear down. The `VERSION` tag is published only if it matches the released sha artifact.
+- Publish gate (`publish-compose.yml`): preflight, publish `sha-<7>` (digest-pinned images + config commit SHA label), verify structure, smoke sha, publish `latest` only when the run is current `infrastructure` main branch, smoke latest on amd64+arm64, start Dozzle, run `flow-check.sh`, tear down. The `VERSION` tag is published only if it matches the released sha artifact.
 - `scripts/check-release-version.sh` is manual; no workflow checks pom/`VERSION` agreement.
 - Gap to remember: `flow-check.sh` runs after `latest` is published, not against `sha-<7>` before promotion. Markdown-only pushes skip publishing entirely.
 
@@ -113,7 +113,7 @@ Changing a port, route path, service ID, database topology, Vault path or secret
 
 - Vault `mem_limit` is 512M in both stacks, not 128M.
 - The source loader is get-or-put: existing paths are skipped, never repaired; `{}` files are skipped too.
-- The script default `SECRETS_DIR` resolves under `infra/` and does not exist in this layout; pass `SECRETS_DIR=../centralized-configuration/service-secrets` for host runs (the Compose loader mounts `/secrets`).
+- The script default `SECRETS_DIR` resolves under `infrastructure/` and does not exist in this layout; pass `SECRETS_DIR=../centralized-configuration/service-secrets` for host runs (the Compose loader mounts `/secrets`).
 - Compose has no `--profiles` flag; the source loader knob is `VAULT_LOAD_PROFILES` (the host script takes `PROFILE`/`PROFILES`/`--profiles`).
 - `docker compose restart` does not apply Compose-file changes; recreate with `up -d`. The tmpfs is discarded on restart.
 - The Postgres init script accepts `-` and leading digits but interpolates names unquoted into `CREATE DATABASE`; keep plain identifiers.
