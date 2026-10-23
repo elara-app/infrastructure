@@ -100,7 +100,7 @@ SECRETS_DIR=../centralized-configuration/service-secrets PROFILES=dev ./scripts/
 
 Existing paths are never repaired: wrong or missing keys inside an existing path stay as they are and a re-run reports `skip`. To apply changed values, remove the Vault path or load a different profile, then re-run the loader.
 
-The script default `SECRETS_DIR` is wrong for this layout: it resolves to `infra/centralized-configuration/service-secrets`, which does not exist, and the run fails with "secrets directory ... does not exist". Always pass `SECRETS_DIR=../centralized-configuration/service-secrets` for host runs. The Compose loader is unaffected because it mounts `/secrets` explicitly.
+The script default `SECRETS_DIR` is wrong for this layout: it resolves to `infrastructure/centralized-configuration/service-secrets`, which does not exist, and the run fails with "secrets directory ... does not exist". Always pass `SECRETS_DIR=../centralized-configuration/service-secrets` for host runs. The Compose loader is unaffected because it mounts `/secrets` explicitly.
 
 ### Published inline loader
 
@@ -256,7 +256,7 @@ The OCI artifact — not the file — is the pinned distribution:
 | `ghcr.io/elara-app/elara-demo:sha-<7>` | All 10 service images pinned by digest (`@sha256:...`) and the config label pinned to a 40-hex `centralized-configuration` `main` commit SHA |
 | `ghcr.io/elara-app/elara-demo:1.3.1` | The `VERSION` tag; published only when it matches the released sha artifact (same config SHA and image digests). Current `VERSION` and all five service poms are `1.3.1` |
 
-`publish-compose.yml` runs on push to `main` (markdown paths ignored) or manual dispatch: prepare (short SHA, config SHA, current-run flag), preflight (service count, no build/env file/configs/secrets, tmpfs-only mounts, Vault 512M, `${EUREKA_URI:` placeholder in the three dev config files, multi-arch Elara images), publish `sha-<7>` with the config pin, verify the sha structure, smoke the sha artifact, publish `latest` only when the run is current infra `main`, smoke `latest` on amd64 and arm64, start Dozzle, run `flow-check.sh`, tear down.
+`publish-compose.yml` runs on push to `main` (markdown paths ignored) or manual dispatch: prepare (short SHA, config SHA, current-run flag), preflight (service count, no build/env file/configs/secrets, tmpfs-only mounts, Vault 512M, `${EUREKA_URI:` placeholder in the three dev config files, multi-arch Elara images), publish `sha-<7>` with the config pin, verify the sha structure, smoke the sha artifact, publish `latest` only when the run is current `infrastructure` main branch, smoke `latest` on amd64 and arm64, start Dozzle, run `flow-check.sh`, tear down.
 
 Known gaps:
 
@@ -316,9 +316,9 @@ Adding a service or profile touches several repositories; this is the infra-side
 1. **Published has no restart cascade.** `restart: true` is absent from every published `depends_on`, so restarting `postgres-*` leaves services against an empty database and restarting `vault` empties the secrets. Recover by restarting the business services and re-running the loader.
 2. **Vault is in-memory in both stacks.** Any Vault restart/recreate loses `secret/*`; the published loader is a completed one-shot and is not re-run by restarting Vault.
 3. **The source loader preserves bad data.** Existing paths are skipped even if keys are missing or wrong; `{}` files are skipped; there is no schema or value validation. Delete the path or use a new profile to repair.
-4. **The source loader default path is wrong.** `SECRETS_DIR` defaults under `infra/`, not the sibling config repo; pass `SECRETS_DIR=../centralized-configuration/service-secrets` from `infra/`.
+4. **The source loader default path is wrong.** `SECRETS_DIR` defaults under `infrastructure/`, not the sibling config repo; pass `SECRETS_DIR=../centralized-configuration/service-secrets` from `infrastructure/`.
 5. **Postgres init accepts invalid-looking names.** It permits `-` and leading digits but interpolates names unquoted into `CREATE DATABASE`; a name like `my-db` fails. Keep plain identifiers.
-6. **Source exposes infra ports on all interfaces.** 8888/8761/8080/5672/15672/8200 are not loopback-bound; only 8081/8082 are. Published defaults all to loopback, but `ELARA_BIND=0.0.0.0` exposes them.
+6. **Source exposes infrastructure ports on all interfaces.** 8888/8761/8080/5672/15672/8200 are not loopback-bound; only 8081/8082 are. Published defaults all to loopback, but `ELARA_BIND=0.0.0.0` exposes them.
 7. **Dozzle has the Docker socket.** It is an explicit local overlay only, mounts `/var/run/docker.sock:ro`, and is not in the OCI artifact. Do not add it to the published stack.
 8. **Published is demo-only.** Dev Vault, known root token, dev DB/Rabbit credentials, no persistence, no TLS, public GitHub config clone, single registry. Do not call it production-ready.
 9. **Published `:latest` floats.** Only `sha-<7>` and `1.3.1` are digest/config pinned. Use the version artifact or `--pull always`.
