@@ -5,7 +5,7 @@
 # binary (1.16.3 == server 1.16.3, no CLI drift) is copied from the pinned server
 # image while bash/jq/base64 (coreutils) come from apk.
 FROM hashicorp/vault:1.16.3 AS vault-bin
-FROM alpine:3.21.8
+FROM alpine:3.24.3
 COPY --from=vault-bin /bin/vault /usr/local/bin/vault
 RUN apk add --no-cache bash jq coreutils \
  && mkdir -p /work/scripts /secrets
