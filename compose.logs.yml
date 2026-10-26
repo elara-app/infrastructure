@@ -6,7 +6,7 @@
 
 services:
   dozzle:
-    image: amir20/dozzle:v11.3.3
+    image: amir20/dozzle:v11.3.4
     ports:
       - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_DOZZLE:-9999}:8080"
     volumes:
