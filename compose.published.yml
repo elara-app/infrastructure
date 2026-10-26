@@ -267,7 +267,7 @@ services:
       - elara-net
 
   rabbitmq:
-    image: rabbitmq:3.13.7-management-alpine
+    image: rabbitmq:4.4.0-management-alpine
     ports:
       - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ:-5672}:5672"
       - "${ELARA_BIND:-127.0.0.1}:${ELARA_PORT_RABBITMQ_MGMT:-15672}:15672"
