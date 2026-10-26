@@ -316,7 +316,7 @@ services:
       - elara-net
 
   vault:
-    image: hashicorp/vault:1.16.3
+    image: hashicorp/vault:2.2.1
     ports:
       - "8200:8200"
     expose:
