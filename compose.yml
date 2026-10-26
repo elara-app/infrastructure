@@ -223,7 +223,7 @@ services:
   # --- Infrastructure services ------------------------------------------------
 
   postgres-inventory:
-    image: postgres:16.15-alpine
+    image: postgres:18.4-alpine
     expose:
       - "5432"
     environment:
@@ -259,7 +259,7 @@ services:
       - elara-net
 
   postgres-uom:
-    image: postgres:16.15-alpine
+    image: postgres:18.4-alpine
     expose:
       - "5432"
     environment:
